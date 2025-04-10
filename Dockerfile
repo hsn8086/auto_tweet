@@ -18,4 +18,4 @@ RUN uv run playwright install-deps
 
 COPY ./src /app/src
 COPY ./main.py /app/main.py
-ENTRYPOINT ["uv", "run", "python", "-u","start.py"]
+ENTRYPOINT ["uv", "run", "python", "-u","main.py"]
