@@ -12,5 +12,6 @@ dependencies = [
     "pydantic>=2.11.3",
     "pydantic-settings>=2.8.1",
     "python-multipart>=0.0.20",
+    "tenacity>=9.1.2",
     "uvicorn>=0.34.0",
 ]
