@@ -1,0 +1,16 @@
+[project]
+name = "auto-tweet"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115.12",
+    "httpx>=0.28.1",
+    "loguru>=0.7.3",
+    "playwright>=1.51.0",
+    "pydantic>=2.11.3",
+    "pydantic-settings>=2.8.1",
+    "python-multipart>=0.0.20",
+    "uvicorn>=0.34.0",
+]
