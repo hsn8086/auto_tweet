@@ -1,15 +1,20 @@
 import asyncio
 from pathlib import Path
 from playwright.async_api import async_playwright, ProxySettings, FilePayload
-from tenacity import retry,stop_after_attempt
+from tenacity import retry, stop_after_attempt
 
 from loguru import logger
 from .model import State
 
+sem = asyncio.Semaphore(1)
+
+
 @retry(stop=stop_after_attempt(5))
 @logger.catch()
-async def send(txt: str, state: State, *, img: FilePayload|None=None, proxy: str = None):
-    async with async_playwright() as p:
+async def send(
+    txt: str, state: State, *, img: FilePayload | None = None, proxy: str = None
+):
+    async with sem, async_playwright() as p:
         logger.info("Launching browser...")
         browser = await p.chromium.launch(
             proxy=ProxySettings(server=proxy) if proxy else None
