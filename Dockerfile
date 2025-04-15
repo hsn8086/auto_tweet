@@ -13,7 +13,7 @@ COPY ./uv.lock /app/uv.lock
 
 RUN uv venv
 RUN uv pip install -e .
-RUN uv run playwright install
+RUN uv run playwright install chromium
 RUN uv run playwright install-deps
 
 COPY ./src /app/src
