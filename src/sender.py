@@ -35,24 +35,24 @@ async def send(
         logger.info("Waiting for login...")
 
         await page.get_by_label("帖子文本").click()
-        not_first = False
+        first = True
         for img in imgs:
             async with page.expect_file_chooser() as fc_info:
-                if not_first:
-                    await page.get_by_label("添加媒体").click()
-                else:
+                if first:
                     await page.get_by_label("添加照片或视频").click()
+                else:
+                    await page.get_by_label("添加媒体").click()
 
                 file_chooser = await fc_info.value
                 await file_chooser.set_files(img)
                 logger.info("Image uploaded.")
-                if not not_first and spoiler:
+                if first and spoiler:
                     await page.get_by_label("编辑媒体").click()
                     await page.get_by_label("内容警告").click()
                     await page.get_by_text("敏感内容").click()
                     await page.get_by_text("保存").click()
                     await page.get_by_label("返回").click()
-                not_first = True
+                first = False
 
         await page.get_by_label("帖子文本").click()
         await page.get_by_label("帖子文本").fill(txt + "\n")
