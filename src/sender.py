@@ -56,7 +56,8 @@ async def send(
                     await page.get_by_text("保存").click()
                     await page.get_by_label("返回").click()
                 first = False
-
+            await asyncio.sleep(3)
+        await asyncio.sleep(5)
         await page.get_by_label("帖子文本").click()
         await page.get_by_label("帖子文本").fill(txt + "\n")
         logger.info("Posting...")
