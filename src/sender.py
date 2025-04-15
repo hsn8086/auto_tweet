@@ -20,6 +20,9 @@ async def send(
     headless=True,
     spoiler=False,
 ):
+    if isinstance(spoiler, str):
+        spoiler = spoiler == "True" or spoiler == "true"
+    print(spoiler,type(spoiler))
     async with sem, async_playwright() as p:
         logger.info("Launching browser...")
         browser = await p.chromium.launch(
