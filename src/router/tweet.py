@@ -9,16 +9,25 @@ router = APIRouter(prefix="/tweet")
 
 @router.post("/post")
 async def post_tweet(
-    state: str, spoiler=False, context="", images: list[UploadFile] = File(...)
+    state: str, spoiler=False, context="", images: list[UploadFile] | None = File(...)
 ):
-    state = State.model_validate_json(state)
+    if not images:
+        images = []
+    state_pyd = State.model_validate_json(state)
     imgs = []
+
     for image in images:
+        assert image.filename and image.content_type
         img = FilePayload(
             name=image.filename, mimeType=image.content_type, buffer=await image.read()
         )
         imgs.append(img)
     config = Config()
     await send(
-        context, state, imgs=imgs, proxy=config.proxy, spoiler=spoiler, headless=True
+        context,
+        state_pyd,
+        media=imgs,
+        proxy=config.proxy,
+        spoiler=spoiler,
+        headless=False,
     )
