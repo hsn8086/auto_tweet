@@ -29,5 +29,5 @@ async def post_tweet(
         media=imgs,
         proxy=config.proxy,
         spoiler=spoiler,
-        headless=False,
+        headless=True,
     )
