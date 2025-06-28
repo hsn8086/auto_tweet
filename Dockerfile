@@ -13,8 +13,8 @@ COPY ./uv.lock /app/uv.lock
 
 RUN uv venv
 RUN uv pip install -e .
-RUN uv run playwright install chromium
-RUN uv run playwright install-deps
+RUN uv run playwright install firefox
+RUN uv run playwright install-deps firefox
 
 COPY ./src /app/src
 COPY ./main.py /app/main.py
