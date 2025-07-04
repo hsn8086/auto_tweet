@@ -12,14 +12,14 @@ from loguru import logger
 from .model import State
 from playwright.async_api import Locator
 
-sem = asyncio.Semaphore(1)
+sem = asyncio.Semaphore(2)
 
 
 async def wait_e(e: Locator, *, timeout: int = 10):
-    for _ in range(timeout):
+    for _ in range(timeout * 10):
         if await e.is_enabled():
             break
-        await asyncio.sleep(1)
+        await asyncio.sleep(0.1)
     else:
         if not await e.is_enabled():
             raise TimeoutError()
@@ -52,9 +52,8 @@ async def send(
             proxy=ProxySettings(server=proxy) if proxy else None,
             headless=headless,
             # headless=False,
-            devtools=True,
+            # devtools=True,
             executable_path="/usr/bin/chromium",
-
         )
         # browser = await p.chromium.launch()
         context = await browser.new_context(
@@ -80,7 +79,7 @@ async def send(
             file_chooser = await fc_info.value
 
             print(file_chooser.element)
-        
+
             await file_chooser.set_files(medium)
             logger.info("Image uploaded.")
             print(medium["name"], medium["mimeType"])
@@ -110,7 +109,7 @@ async def send(
         await click_e(page.get_by_label("主页时间线").get_by_text("发帖"), timeout=60)
         await page.screenshot(path="ss/3.png")
         logger.info("Post sent.")
-        await asyncio.sleep(10)
-        await page.close()
-        await context.close()
-        await browser.close()
+    await asyncio.sleep(60)
+    await page.close()
+    await context.close()
+    await browser.close()
