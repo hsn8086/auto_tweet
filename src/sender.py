@@ -56,7 +56,7 @@ async def send(
         page = await context.new_page()
         await page.goto("https://x.com", timeout=60 * 10**3)
         logger.info("Waiting for login...")
-
+        await page.screenshot(path="ss/1.png")
         await page.get_by_label("帖子文本").click()
         first = True
         for medium in media:
@@ -86,6 +86,7 @@ async def send(
                     await click_e(page.get_by_label("返回"))
             first = False
             # await asyncio.sleep(3)
+        await page.screenshot(path="ss/2.png")
         await click_e(page.get_by_label("帖子文本"))
         await asyncio.sleep(1)
         await page.get_by_label("帖子文本").type(txt + "\n")
@@ -93,6 +94,7 @@ async def send(
         logger.info("Posting...")
         # await asyncio.sleep(10000)
         await click_e(page.get_by_label("主页时间线").get_by_text("发帖"), timeout=60)
+        await page.screenshot(path="ss/3.png")
         await asyncio.sleep(10)
         await page.close()
         await context.close()

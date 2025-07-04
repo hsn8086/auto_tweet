@@ -25,9 +25,45 @@
 """
 
 import fastapi
+import logging
+from loguru import logger
 
 from .router import routers
 
 
+class InterceptHandler(logging.Handler):
+    def emit(self, record):
+        # 获取 Loguru 的 level
+        try:
+            level = logger.level(record.levelname).name
+        except ValueError:
+            level = record.levelno
+        logger.opt(depth=6, exception=record.exc_info).log(level, record.getMessage())
+
+
+# 拦截标准日志
+logging.basicConfig(handlers=[InterceptHandler()], level=0, force=True)
+
+# 可选：拦截 Uvicorn/Starlette 的 logger
+for name in ("uvicorn", "uvicorn.error", "uvicorn.access", "fastapi"):
+    logging.getLogger(name).handlers = [InterceptHandler()]
+    logging.getLogger(name).propagate = False
+
+logger.add(
+    sink="logs/auto-tweet_general.log",
+    rotation="500 MB",
+    retention="30 days",
+    compression="zip",
+    level="INFO",
+)
+logger.add(
+    sink="logs/auto-tweet_error.log",
+    rotation="500 MB",
+    retention="30 days",
+    compression="zip",
+    level="ERROR",
+    backtrace=True,
+    diagnose=True,
+)
 app = fastapi.FastAPI()
 app.include_router(routers, prefix="/api/v1")

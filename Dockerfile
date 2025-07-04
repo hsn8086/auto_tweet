@@ -12,7 +12,7 @@ COPY ./pyproject.toml /app/pyproject.toml
 COPY ./uv.lock /app/uv.lock
 
 RUN uv venv
-RUN uv pip install -e .
+RUN uv sync
 RUN uv run playwright install firefox
 RUN uv run playwright install-deps firefox
 

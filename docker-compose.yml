@@ -3,6 +3,9 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+    volumes:
+      - ./ss:/app/ss
+      
 
     ports:
       - "8000:8000"
