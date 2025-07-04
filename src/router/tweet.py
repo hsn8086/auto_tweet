@@ -19,7 +19,9 @@ async def post_tweet(
     for image in images:
         assert image.filename and image.content_type
         img = FilePayload(
-            name=image.filename, mimeType=image.content_type, buffer=await image.read()
+            name=image.filename,
+            mimeType=image.content_type,
+            buffer=await image.read(),
         )
         imgs.append(img)
     config = Config()
