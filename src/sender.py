@@ -30,8 +30,8 @@ async def click_e(e: Locator, *, timeout: int = 10):
     await e.click()
 
 
-@retry(stop=stop_after_attempt(5))
 @logger.catch()
+@retry(stop=stop_after_attempt(5))
 async def send(
     txt: str,
     state: State,
