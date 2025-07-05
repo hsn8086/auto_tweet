@@ -100,6 +100,12 @@ async def send(
                 first = False
                 # await asyncio.sleep(3)
             await page.screenshot(path="ss/2.png")
+
+            if media:
+                await wait_e(
+                    page.get_by_label("主页时间线").get_by_text("发帖"), timeout=600
+                )
+
             await click_e(page.get_by_label("帖子文本"))
 
             await page.get_by_label("帖子文本").wait_for(state="attached")
@@ -107,7 +113,9 @@ async def send(
 
             await page.get_by_label("帖子文本").fill(txt + "\n")
             logger.info("Posting...")
-            await click_e(page.get_by_label("主页时间线").get_by_text("发帖"), timeout=60)
+            await click_e(
+                page.get_by_label("主页时间线").get_by_text("发帖"), timeout=60
+            )
             await page.screenshot(path="ss/3.png")
             logger.info("Post sent.")
         await asyncio.sleep(60)
