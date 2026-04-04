@@ -15,3 +15,8 @@ class CookieItem(BaseModel):
 class State(BaseModel):
     cookies: list[CookieItem]
     # origins:list[dict]
+
+
+class PostSentError(Exception):
+    """推文已发送成功，但后续操作(截图等)失败"""
+    pass

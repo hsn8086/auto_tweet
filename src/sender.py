@@ -1,16 +1,25 @@
 import asyncio
 from pathlib import Path
-from playwright.async_api import (
-    async_playwright,
-    ProxySettings,
-    FilePayload,
-    StorageState,
-)
-from tenacity import retry, stop_after_attempt
 
 from loguru import logger
-from .model import State
-from playwright.async_api import Locator
+from playwright.async_api import (
+    Error as PlaywrightError,
+)
+from playwright.async_api import (
+    FilePayload,
+    Locator,
+    ProxySettings,
+    StorageState,
+    async_playwright,
+)
+from tenacity import (
+    retry,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_exponential,
+)
+
+from .model import PostSentError, State
 
 sem = asyncio.Semaphore(2)
 
@@ -30,8 +39,14 @@ async def click_e(e: Locator, *, timeout: int = 10):
     await e.click()
 
 
-@logger.catch()
-@retry(stop=stop_after_attempt(5))
+@retry(
+    stop=stop_after_attempt(5),
+    wait=wait_exponential(multiplier=1, min=2, max=30),
+    retry=retry_if_exception_type(
+        (TimeoutError, ConnectionError, OSError, PlaywrightError)
+    ),
+    reraise=True,
+)
 async def send(
     txt: str,
     state: State,
@@ -44,17 +59,17 @@ async def send(
     if not media:
         media = []
     if isinstance(spoiler, str):
-        spoiler = spoiler == "True" or spoiler == "true"
-    print(spoiler, type(spoiler))
-    async with async_playwright() as p:
-        async with sem:
+        spoiler = spoiler in ("True", "true")
+
+    posted = False
+
+    async with sem:
+        async with async_playwright() as p:
             logger.info("Launching browser...")
             browser = await p.chromium.launch(
                 channel="msedge",
                 proxy=ProxySettings(server=proxy) if proxy else None,
                 headless=headless,
-                # headless=False,
-                # devtools=True,
                 executable_path="/usr/bin/chromium",
                 args=[
                     "--disable-gpu",
@@ -62,67 +77,70 @@ async def send(
                     "--enable-unsafe-swiftshader",
                 ],
             )
-            # browser = await p.chromium.launch()
-            context = await browser.new_context(
-                storage_state=StorageState(**state.model_dump()), locale="zh-CN"
-            )
-            page = await context.new_page()
-            page.on("console", lambda msg: logger.log(msg.type.upper(), msg.text))
-            await page.goto("https://x.com", timeout=60 * 10**3)
-            logger.info("Waiting for login...")
-            await page.screenshot(path="ss/1.png")
-            await page.get_by_label("帖子文本").click()
-            first = True
-            for medium in media:
-                async with page.expect_file_chooser() as fc_info:
-                    if first:
-                        # js_handle = await page.get_by_label("添加照片或视频").evaluate_handle(
-                        #     """element => element""",)
-
-                        # print(js_handle)
-                        await click_e(page.get_by_label("添加照片或视频"))
-                    else:
-                        await click_e(page.get_by_label("添加媒体"))
-
-                file_chooser = await fc_info.value
-
-                print(file_chooser.element)
-
-                await file_chooser.set_files(medium)
-                logger.info("Image uploaded.")
-                print(medium["name"], medium["mimeType"])
-
-                if first and spoiler:
-                    # await asyncio.sleep(3)
-                    await click_e(page.get_by_label("编辑媒体"))
-                    await click_e(page.get_by_label("内容警告"))
-                    await click_e(page.get_by_text("敏感内容"))
-                    if "video" in medium["mimeType"]:
-                        print("video")
-                        await click_e(page.get_by_text("完成"))
-                        await click_e(page.get_by_text("完成"))
-                    else:
-                        await click_e(page.get_by_text("保存"))
-                        await click_e(page.get_by_label("返回"))
-                first = False
-                # await asyncio.sleep(3)
-            await page.screenshot(path="ss/2.png")
-
-            if media:
-                await wait_e(
-                    page.get_by_label("主页时间线").get_by_text("发帖"), timeout=600
+            try:
+                context = await browser.new_context(
+                    storage_state=StorageState(**state.model_dump()), locale="zh-CN"
                 )
+                page = await context.new_page()
+                page.on("console", lambda msg: logger.log(msg.type.upper(), msg.text))
+                await page.goto("https://x.com", timeout=60_000)
+                logger.info("Page loaded.")
+                await page.screenshot(path="ss/1.png")
+                await page.get_by_label("帖子文本").click()
 
-            await click_e(page.get_by_label("帖子文本"))
+                first = True
+                for medium in media:
+                    async with page.expect_file_chooser() as fc_info:
+                        if first:
+                            await click_e(page.get_by_label("添加照片或视频"))
+                        else:
+                            await click_e(page.get_by_label("添加媒体"))
 
-            await page.get_by_label("帖子文本").wait_for(state="attached")
-            await page.get_by_label("帖子文本").focus()
+                    file_chooser = await fc_info.value
+                    await file_chooser.set_files(medium)
+                    logger.info(
+                        "Image uploaded: {} ({})", medium["name"], medium["mimeType"]
+                    )
 
-            await page.get_by_label("帖子文本").fill(txt + "\n")
-            logger.info("Posting...")
-            await click_e(
-                page.get_by_label("主页时间线").get_by_text("发帖"), timeout=60
-            )
-            await page.screenshot(path="ss/3.png")
-            logger.info("Post sent.")
-        await asyncio.sleep(60)
+                    if first and spoiler:
+                        await click_e(page.get_by_label("编辑媒体"))
+                        await click_e(page.get_by_label("内容警告"))
+                        await click_e(page.get_by_text("敏感内容"))
+                        if "video" in medium["mimeType"]:
+                            logger.debug("Video detected, clicking 完成 twice.")
+                            await click_e(page.get_by_text("完成"))
+                            await click_e(page.get_by_text("完成"))
+                        else:
+                            await click_e(page.get_by_text("保存"))
+                            await click_e(page.get_by_label("返回"))
+                    first = False
+
+                await page.screenshot(path="ss/2.png")
+
+                if media:
+                    await wait_e(
+                        page.get_by_label("主页时间线").get_by_text("发帖"), timeout=600
+                    )
+
+                await click_e(page.get_by_label("帖子文本"))
+                await page.get_by_label("帖子文本").wait_for(state="attached")
+                await page.get_by_label("帖子文本").focus()
+                await page.get_by_label("帖子文本").fill(txt + "\n")
+
+                logger.info("Posting...")
+                await click_e(
+                    page.get_by_label("主页时间线").get_by_text("发帖"), timeout=60
+                )
+                posted = True
+
+                await page.screenshot(path="ss/3.png")
+                logger.info("Post sent.")
+
+                await asyncio.sleep(60)
+            except Exception as e:
+                if posted:
+                    logger.warning("Post sent but post-send operations failed: {}", e)
+                    raise PostSentError(str(e))
+                raise
+            finally:
+                await browser.close()
