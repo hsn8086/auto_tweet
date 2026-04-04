@@ -50,17 +50,24 @@ async def send(
         async with sem:
             logger.info("Launching browser...")
             browser = await p.chromium.launch(
+                channel="msedge",
                 proxy=ProxySettings(server=proxy) if proxy else None,
                 headless=headless,
                 # headless=False,
                 # devtools=True,
                 executable_path="/usr/bin/chromium",
+                args=[
+                    "--disable-gpu",
+                    "--no-sandbox",
+                    "--enable-unsafe-swiftshader",
+                ],
             )
             # browser = await p.chromium.launch()
             context = await browser.new_context(
                 storage_state=StorageState(**state.model_dump()), locale="zh-CN"
             )
             page = await context.new_page()
+            page.on("console", lambda msg: logger.log(msg.type.upper(), msg.text))
             await page.goto("https://x.com", timeout=60 * 10**3)
             logger.info("Waiting for login...")
             await page.screenshot(path="ss/1.png")
