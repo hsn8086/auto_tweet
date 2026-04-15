@@ -1,5 +1,6 @@
 import asyncio
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from loguru import logger
 from playwright.async_api import (
@@ -23,6 +24,9 @@ from .model import PostSentError, State
 
 sem = asyncio.Semaphore(2)
 
+if TYPE_CHECKING:
+    from playwright.async_api import Page
+
 
 async def wait_e(e: Locator, *, timeout: int = 10):
     for _ in range(timeout * 10):
@@ -37,6 +41,51 @@ async def wait_e(e: Locator, *, timeout: int = 10):
 async def click_e(e: Locator, *, timeout: int = 10):
     await wait_e(e, timeout=timeout)
     await e.click()
+
+
+async def wait_first_available(locators: list[Locator], *, timeout: int = 10) -> Locator:
+    for _ in range(timeout * 10):
+        for locator in locators:
+            candidate = locator.first
+            try:
+                if await candidate.is_visible() and await candidate.is_enabled():
+                    return candidate
+            except PlaywrightError:
+                continue
+        await asyncio.sleep(0.1)
+    raise TimeoutError()
+
+
+async def click_first_available(locators: list[Locator], *, timeout: int = 10) -> Locator:
+    candidate = await wait_first_available(locators, timeout=timeout)
+    await candidate.click()
+    return candidate
+
+
+async def click_if_available(locators: list[Locator], *, timeout: int = 10) -> bool:
+    try:
+        await click_first_available(locators, timeout=timeout)
+    except TimeoutError:
+        return False
+    return True
+
+
+def post_button_candidates(page: "Page") -> list[Locator]:
+    return [
+        page.get_by_test_id("tweetButtonInline"),
+        page.get_by_role("button", name="发帖"),
+        page.get_by_role("button", name="Post"),
+        page.get_by_label("主页时间线").get_by_text("发帖"),
+    ]
+
+
+def media_back_candidates(page: "Page") -> list[Locator]:
+    return [
+        page.get_by_label("返回"),
+        page.get_by_role("button", name="返回"),
+        page.get_by_label("关闭"),
+        page.get_by_role("button", name="关闭"),
+    ]
 
 
 @retry(
@@ -87,6 +136,7 @@ async def send(
                 logger.info("Page loaded.")
                 await page.screenshot(path="ss/1.png")
                 await page.get_by_label("帖子文本").click()
+                post_buttons = post_button_candidates(page)
 
                 first = True
                 for medium in media:
@@ -112,15 +162,14 @@ async def send(
                             await click_e(page.get_by_text("完成"))
                         else:
                             await click_e(page.get_by_text("保存"))
-                            await click_e(page.get_by_label("返回"))
+                            # X 的媒体编辑页按钮文案经常变，保存后不强依赖单一“返回”按钮。
+                            await click_if_available(media_back_candidates(page), timeout=5)
                     first = False
 
                 await page.screenshot(path="ss/2.png")
 
                 if media:
-                    await wait_e(
-                        page.get_by_label("主页时间线").get_by_text("发帖"), timeout=600
-                    )
+                    await wait_first_available(post_buttons, timeout=600)
 
                 await click_e(page.get_by_label("帖子文本"))
                 await page.get_by_label("帖子文本").wait_for(state="attached")
@@ -128,9 +177,7 @@ async def send(
                 await page.get_by_label("帖子文本").fill(txt + "\n")
 
                 logger.info("Posting...")
-                await click_e(
-                    page.get_by_label("主页时间线").get_by_text("发帖"), timeout=60
-                )
+                await click_first_available(post_buttons, timeout=60)
                 posted = True
 
                 await page.screenshot(path="ss/3.png")
