@@ -1,5 +1,4 @@
 import asyncio
-from pathlib import Path
 from typing import TYPE_CHECKING
 
 from loguru import logger
@@ -23,27 +22,41 @@ from tenacity import (
 from .model import PostSentError, State
 
 sem = asyncio.Semaphore(2)
+RETRYABLE_SEND_EXCEPTIONS = (TimeoutError, ConnectionError, OSError, PlaywrightError)
 
 if TYPE_CHECKING:
     from playwright.async_api import Page
 
 
-async def wait_e(e: Locator, *, timeout: int = 10):
+def describe_send_exception(exc: BaseException) -> str:
+    detail = str(exc).strip()
+    if detail:
+        return detail
+    return exc.__class__.__name__
+
+
+async def wait_e(e: Locator, *, timeout: int = 10, description: str = "element"):
     for _ in range(timeout * 10):
-        if await e.is_enabled():
-            break
+        try:
+            if await e.is_enabled():
+                return
+        except PlaywrightError:
+            pass
         await asyncio.sleep(0.1)
-    else:
-        if not await e.is_enabled():
-            raise TimeoutError()
+
+    raise TimeoutError(
+        f"Timed out waiting for {description} to become enabled after {timeout}s"
+    )
 
 
-async def click_e(e: Locator, *, timeout: int = 10):
-    await wait_e(e, timeout=timeout)
+async def click_e(e: Locator, *, timeout: int = 10, description: str = "element"):
+    await wait_e(e, timeout=timeout, description=description)
     await e.click()
 
 
-async def wait_first_available(locators: list[Locator], *, timeout: int = 10) -> Locator:
+async def wait_first_available(
+    locators: list[Locator], *, timeout: int = 10, description: str = "element"
+) -> Locator:
     for _ in range(timeout * 10):
         for locator in locators:
             candidate = locator.first
@@ -53,21 +66,38 @@ async def wait_first_available(locators: list[Locator], *, timeout: int = 10) ->
             except PlaywrightError:
                 continue
         await asyncio.sleep(0.1)
-    raise TimeoutError()
+    raise TimeoutError(
+        f"Timed out waiting for {description} to become available after {timeout}s"
+    )
 
 
-async def click_first_available(locators: list[Locator], *, timeout: int = 10) -> Locator:
-    candidate = await wait_first_available(locators, timeout=timeout)
+async def click_first_available(
+    locators: list[Locator], *, timeout: int = 10, description: str = "element"
+) -> Locator:
+    candidate = await wait_first_available(
+        locators, timeout=timeout, description=description
+    )
     await candidate.click()
     return candidate
 
 
-async def click_if_available(locators: list[Locator], *, timeout: int = 10) -> bool:
+async def click_if_available(
+    locators: list[Locator], *, timeout: int = 10, description: str = "element"
+) -> bool:
     try:
-        await click_first_available(locators, timeout=timeout)
+        await click_first_available(locators, timeout=timeout, description=description)
     except TimeoutError:
         return False
     return True
+
+
+def composer_candidates(page: "Page") -> list[Locator]:
+    return [
+        page.get_by_label("帖子文本"),
+        page.get_by_label("Post text"),
+        page.get_by_test_id("tweetTextarea_0"),
+        page.locator("[data-testid='tweetTextarea_0']"),
+    ]
 
 
 def post_button_candidates(page: "Page") -> list[Locator]:
@@ -91,9 +121,7 @@ def media_back_candidates(page: "Page") -> list[Locator]:
 @retry(
     stop=stop_after_attempt(5),
     wait=wait_exponential(multiplier=1, min=2, max=30),
-    retry=retry_if_exception_type(
-        (TimeoutError, ConnectionError, OSError, PlaywrightError)
-    ),
+    retry=retry_if_exception_type(RETRYABLE_SEND_EXCEPTIONS),
     reraise=True,
 )
 async def send(
@@ -132,19 +160,32 @@ async def send(
                 )
                 page = await context.new_page()
                 page.on("console", lambda msg: logger.log(msg.type.upper(), msg.text))
-                await page.goto("https://x.com", timeout=60_000)
-                logger.info("Page loaded.")
+                await page.goto(
+                    "https://x.com/home", wait_until="domcontentloaded", timeout=90_000
+                )
+                logger.info("Page DOM loaded.")
                 await page.screenshot(path="ss/1.png")
-                await page.get_by_label("帖子文本").click()
+                composer = await wait_first_available(
+                    composer_candidates(page),
+                    timeout=45,
+                    description="post composer",
+                )
+                await click_e(composer, timeout=30, description="post composer")
                 post_buttons = post_button_candidates(page)
 
                 first = True
                 for medium in media:
                     async with page.expect_file_chooser() as fc_info:
                         if first:
-                            await click_e(page.get_by_label("添加照片或视频"))
+                            await click_e(
+                                page.get_by_label("添加照片或视频"),
+                                description="first media button",
+                            )
                         else:
-                            await click_e(page.get_by_label("添加媒体"))
+                            await click_e(
+                                page.get_by_label("添加媒体"),
+                                description="additional media button",
+                            )
 
                     file_chooser = await fc_info.value
                     await file_chooser.set_files(medium)
@@ -153,31 +194,54 @@ async def send(
                     )
 
                     if first and spoiler:
-                        await click_e(page.get_by_label("编辑媒体"))
-                        await click_e(page.get_by_label("内容警告"))
-                        await click_e(page.get_by_text("敏感内容"))
+                        await click_e(
+                            page.get_by_label("编辑媒体"),
+                            description="edit media button",
+                        )
+                        await click_e(
+                            page.get_by_label("内容警告"),
+                            description="content warning button",
+                        )
+                        await click_e(
+                            page.get_by_text("敏感内容"),
+                            description="sensitive content option",
+                        )
                         if "video" in medium["mimeType"]:
                             logger.debug("Video detected, clicking 完成 twice.")
-                            await click_e(page.get_by_text("完成"))
-                            await click_e(page.get_by_text("完成"))
+                            await click_e(
+                                page.get_by_text("完成"), description="done button"
+                            )
+                            await click_e(
+                                page.get_by_text("完成"), description="done button"
+                            )
                         else:
-                            await click_e(page.get_by_text("保存"))
+                            await click_e(
+                                page.get_by_text("保存"), description="save button"
+                            )
                             # X 的媒体编辑页按钮文案经常变，保存后不强依赖单一“返回”按钮。
-                            await click_if_available(media_back_candidates(page), timeout=5)
+                            await click_if_available(
+                                media_back_candidates(page),
+                                timeout=5,
+                                description="media back button",
+                            )
                     first = False
 
                 await page.screenshot(path="ss/2.png")
 
                 if media:
-                    await wait_first_available(post_buttons, timeout=600)
+                    await wait_first_available(
+                        post_buttons, timeout=600, description="post button"
+                    )
 
-                await click_e(page.get_by_label("帖子文本"))
-                await page.get_by_label("帖子文本").wait_for(state="attached")
-                await page.get_by_label("帖子文本").focus()
-                await page.get_by_label("帖子文本").fill(txt + "\n")
+                await click_e(composer, timeout=30, description="post composer")
+                await composer.wait_for(state="attached")
+                await composer.focus()
+                await composer.fill(txt + "\n")
 
                 logger.info("Posting...")
-                await click_first_available(post_buttons, timeout=60)
+                await click_first_available(
+                    post_buttons, timeout=60, description="post button"
+                )
                 posted = True
 
                 await page.screenshot(path="ss/3.png")
@@ -186,8 +250,11 @@ async def send(
                 await asyncio.sleep(60)
             except Exception as e:
                 if posted:
-                    logger.warning("Post sent but post-send operations failed: {}", e)
-                    raise PostSentError(str(e))
+                    detail = describe_send_exception(e)
+                    logger.warning(
+                        "Post sent but post-send operations failed: {}", detail
+                    )
+                    raise PostSentError(detail)
                 raise
             finally:
                 await browser.close()

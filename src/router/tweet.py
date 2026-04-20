@@ -6,7 +6,7 @@ from tenacity import RetryError
 
 from ..config import Config
 from ..model import State, PostSentError
-from ..sender import send
+from ..sender import RETRYABLE_SEND_EXCEPTIONS, describe_send_exception, send
 
 router = APIRouter(prefix="/tweet")
 
@@ -44,10 +44,18 @@ async def post_tweet(
             headless=True,
         )
         return {"status": "ok"}
-    except PostSentError:
-        return {"status": "ok", "warning": "post sent but post-send operations failed"}
-    except RetryError:
-        raise HTTPException(status_code=502, detail="发送失败，已重试5次")
+    except PostSentError as e:
+        warning = describe_send_exception(e)
+        return {"status": "ok", "warning": warning}
+    except RETRYABLE_SEND_EXCEPTIONS as e:
+        detail = describe_send_exception(e)
+        logger.warning("Retriable error in post_tweet: {}", detail)
+        raise HTTPException(status_code=502, detail=detail)
+    except RetryError as e:
+        detail = describe_send_exception(e)
+        logger.warning("RetryError in post_tweet: {}", detail)
+        raise HTTPException(status_code=502, detail=detail)
     except Exception as e:
-        logger.error("Unexpected error in post_tweet: {}", e)
-        raise HTTPException(status_code=500, detail="内部错误")
+        detail = describe_send_exception(e)
+        logger.error("Unexpected error in post_tweet: {}", detail)
+        raise HTTPException(status_code=500, detail=detail)
