@@ -5,8 +5,10 @@ services:
       dockerfile: Dockerfile
     volumes:
       - ./ss:/app/ss
+      - ./data:/app/data
     environment:
       - proxy=${proxy:-}
+    init: true
 
     ports:
       - "8000:8000"
