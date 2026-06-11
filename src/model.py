@@ -19,4 +19,7 @@ class State(BaseModel):
 
 class PostSentError(Exception):
     """推文已发送成功，但后续操作(截图等)失败"""
-    pass
+
+    def __init__(self, message: str = "", *, tweet_id: str | None = None) -> None:
+        super().__init__(message)
+        self.tweet_id = tweet_id

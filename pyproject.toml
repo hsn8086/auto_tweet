@@ -9,6 +9,7 @@ dependencies = [
     "httpx>=0.28.1",
     "loguru>=0.7.3",
     "playwright>=1.51.0",
+    "playwright-stealth>=2.0.0",
     "pydantic>=2.11.3",
     "pydantic-settings>=2.8.1",
     "python-multipart>=0.0.20",

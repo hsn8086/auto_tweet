@@ -58,6 +58,79 @@ class SenderHelperTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(detail, "TimeoutError")
 
+    async def test_take_debug_screenshot_does_not_raise_on_timeout(self) -> None:
+        import asyncio
+        from unittest.mock import patch
+
+        class SlowPage:
+            async def screenshot(self, *, path: str) -> None:
+                await asyncio.sleep(1)
+
+        with patch("src.sender.SCREENSHOT_TIMEOUT_SECONDS", 0.01):
+            await sender.take_debug_screenshot(cast(Any, SlowPage()), "ss/1.png")
+
+
+class FakePage:
+    def __init__(self, url: str, *, composer: "FakeLocator | None" = None) -> None:
+        self.url = url
+        self._composer = composer or FakeLocator(visible=False, enabled=False)
+
+    def get_by_label(self, *_args, **_kwargs) -> "FakeLocator":
+        return self._composer
+
+    def get_by_test_id(self, *_args, **_kwargs) -> "FakeLocator":
+        return self._composer
+
+    def locator(self, *_args, **_kwargs) -> "FakeLocator":
+        return self._composer
+
+
+class LoginBounceTests(unittest.IsolatedAsyncioTestCase):
+    def test_is_login_bounce_url_detects_login_pages(self) -> None:
+        bounced = [
+            "https://x.com/i/jf/onboarding/web?redirect_after_login=%2Fcompose%2Fpost&mode=login",
+            "https://x.com/i/flow/login",
+            "https://x.com/?mode=login",
+            "https://x.com/",
+            "https://twitter.com",
+        ]
+        for url in bounced:
+            self.assertTrue(sender.is_login_bounce_url(url), url)
+
+    def test_is_login_bounce_url_allows_normal_pages(self) -> None:
+        normal = [
+            "https://x.com/home",
+            "https://x.com/compose/post",
+            "https://twitter.com/compose/tweet",
+            "https://x.com/i/web/status/123",
+            "",
+        ]
+        for url in normal:
+            self.assertFalse(sender.is_login_bounce_url(url), url)
+
+    async def test_wait_composer_or_login_fails_fast_on_login_bounce(self) -> None:
+        page = FakePage(
+            "https://x.com/i/jf/onboarding/web?redirect_after_login=%2Fcompose%2Fpost&mode=login"
+        )
+
+        result = await sender.wait_composer_or_login(cast(Any, page), timeout=30)
+
+        self.assertIsNone(result)
+
+    async def test_wait_composer_or_login_returns_composer(self) -> None:
+        composer = FakeLocator()
+        page = FakePage("https://x.com/home", composer=composer)
+
+        result = await sender.wait_composer_or_login(cast(Any, page), timeout=1)
+
+        self.assertIs(result, composer)
+
+    async def test_wait_composer_or_login_times_out_with_message(self) -> None:
+        page = FakePage("https://x.com/home")
+
+        with self.assertRaisesRegex(TimeoutError, "post composer"):
+            await sender.wait_composer_or_login(cast(Any, page), timeout=1)
+
 
 if __name__ == "__main__":
     unittest.main()
