@@ -11,3 +11,13 @@ wheels/
 
 # project
 test.py
+.env
+data/
+logs/
+ss/
+*state*.json
+custom-state*.json
+*.bak*
+.claude/
+.pytest_cache/
+.ruff_cache/
