@@ -5,8 +5,11 @@ USER root
 RUN apt-get update
 RUN apt-get install -y chromium 
 
-# Install Poetry
-RUN pip3 install uv
+# Install uv（qj 构建直连 pypi 会卡死，默认走清华镜像；可 --build-arg 覆盖）
+ARG PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple
+ENV UV_INDEX_URL=${PIP_INDEX_URL} \
+    UV_HTTP_TIMEOUT=120
+RUN pip3 install -i ${PIP_INDEX_URL} uv
 
 WORKDIR /app
 
