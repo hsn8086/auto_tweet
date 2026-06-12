@@ -279,3 +279,59 @@ async def get_tweet_metrics(
         logger.error("Unexpected error in get_tweet_metrics: {}", detail)
         raise HTTPException(status_code=502, detail=detail)
     return {"status": "ok", **metrics}
+
+
+USER_METRICS_TIMEOUT_SECONDS = 60 * 8
+
+
+@router.post("/user_metrics")
+async def get_user_tweets_metrics_route(
+    state_form: Annotated[str | None, Form(alias="state")] = None,
+    screen_name_form: Annotated[str | None, Form(alias="screen_name")] = None,
+    until_hours_form: Annotated[int, Form(alias="until_hours")] = 96,
+    max_scrolls_form: Annotated[int, Form(alias="max_scrolls")] = 30,
+    api_key: Annotated[str | None, Header(alias="X-Auto-Tweet-Key")] = None,
+):
+    """批量收集某账号时间线近 until_hours 小时推文的指标（一次浏览器会话）。"""
+    from ..sender import fetch_user_tweets_metrics
+
+    config = Config()
+    _require_api_key(config, api_key)
+
+    if state_form is None or not screen_name_form or not screen_name_form.strip():
+        raise HTTPException(status_code=400, detail="state 和 screen_name 都是必填")
+    until_hours = max(1, min(until_hours_form, 24 * 30))
+    max_scrolls = max(1, min(max_scrolls_form, 60))
+    try:
+        state_pyd = State.model_validate_json(state_form)
+    except ValidationError as e:
+        raise HTTPException(status_code=400, detail=f"无效的 state 参数: {e}")
+
+    try:
+        tweets = await asyncio.wait_for(
+            fetch_user_tweets_metrics(
+                screen_name_form.strip(),
+                state_pyd,
+                until_hours=until_hours,
+                max_scrolls=max_scrolls,
+                proxy=config.proxy,
+                headless=True,
+            ),
+            timeout=USER_METRICS_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="收集时间线数据超时")
+    except RETRYABLE_SEND_EXCEPTIONS as e:
+        detail = describe_send_exception(e)
+        logger.warning("Retriable error in get_user_tweets_metrics: {}", detail)
+        raise HTTPException(status_code=502, detail=detail)
+    except Exception as e:
+        detail = describe_send_exception(e)
+        logger.error("Unexpected error in get_user_tweets_metrics: {}", detail)
+        raise HTTPException(status_code=502, detail=detail)
+    return {
+        "status": "ok",
+        "screen_name": screen_name_form.strip().lstrip("@"),
+        "count": len(tweets),
+        "tweets": tweets,
+    }

@@ -1,4 +1,5 @@
 import asyncio
+from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any
 
 from loguru import logger
@@ -192,33 +193,241 @@ def parse_tweet_metrics_payload(payload: Any) -> dict[str, Any]:
                         if isinstance(tweet_results, dict):
                             candidates.append(tweet_results.get("result"))
     for candidate in candidates:
-        node = _unwrap_tweet_node(candidate)
-        if node is None:
-            continue
-        legacy = node.get("legacy")
-        views = node.get("views") if isinstance(node.get("views"), dict) else {}
-        if not isinstance(legacy, dict):
-            continue
-        rest_id = node.get("rest_id")
-        if isinstance(rest_id, (str, int)):
-            rest_id_str = str(rest_id).strip()
-        else:
-            rest_id_str = ""
-        if not rest_id_str:
-            continue
-        return {
-            "tweet_id": rest_id_str,
-            "likes": _coerce_int(legacy.get("favorite_count")),
-            "retweets": _coerce_int(legacy.get("retweet_count")),
-            "replies": _coerce_int(legacy.get("reply_count")),
-            "quotes": _coerce_int(legacy.get("quote_count")),
-            "bookmarks": _coerce_int(legacy.get("bookmark_count")),
-            "views": _coerce_int(
-                views.get("count") if isinstance(views, dict) else None
-            ),
-            "created_at": str(legacy.get("created_at") or ""),
-        }
+        metrics = _metrics_from_tweet_node(candidate)
+        if metrics is not None:
+            return metrics
     return {}
+
+
+def _metrics_from_tweet_node(candidate: Any) -> dict[str, Any] | None:
+    """从 GraphQL tweet result 节点提取指标；非 tweet 节点返回 None。"""
+    node = _unwrap_tweet_node(candidate)
+    if node is None:
+        return None
+    legacy = node.get("legacy")
+    views = node.get("views") if isinstance(node.get("views"), dict) else {}
+    if not isinstance(legacy, dict):
+        return None
+    # 转推：指标属于原推且作者不是本账号，统计无意义，跳过。
+    if "retweeted_status_result" in legacy:
+        return None
+    rest_id = node.get("rest_id")
+    if isinstance(rest_id, (str, int)):
+        rest_id_str = str(rest_id).strip()
+    else:
+        rest_id_str = ""
+    if not rest_id_str:
+        return None
+    return {
+        "tweet_id": rest_id_str,
+        "likes": _coerce_int(legacy.get("favorite_count")),
+        "retweets": _coerce_int(legacy.get("retweet_count")),
+        "replies": _coerce_int(legacy.get("reply_count")),
+        "quotes": _coerce_int(legacy.get("quote_count")),
+        "bookmarks": _coerce_int(legacy.get("bookmark_count")),
+        "views": _coerce_int(views.get("count") if isinstance(views, dict) else None),
+        "created_at": str(legacy.get("created_at") or ""),
+    }
+
+
+def is_user_tweets_response(response: "Response") -> bool:
+    # 兼容 UserTweets / UserTweetsAndReplies（X 改版时 operation 名可能切换）
+    if "UserTweets" not in response.url:
+        return False
+    try:
+        return response.request.method == "GET"
+    except Exception:
+        return False
+
+
+def parse_tweet_created_at(raw: str) -> "datetime | None":
+    """解析 X legacy.created_at（如 'Wed Oct 10 20:19:24 +0000 2018'）。"""
+    text = (raw or "").strip()
+    if not text:
+        return None
+    try:
+        return datetime.strptime(text, "%a %b %d %H:%M:%S %z %Y")
+    except ValueError:
+        return None
+
+
+def parse_user_tweets_payload(payload: Any) -> list[dict[str, Any]]:
+    """解析 UserTweets 时间线响应，返回推文指标列表。
+
+    - TimelinePinEntry（置顶）单独标 pinned=True，调用方判断时间窗时应忽略；
+    - cursor / module 等非 tweet entry 跳过；转推在 _metrics_from_tweet_node 剔除。
+    """
+    if not isinstance(payload, dict):
+        return []
+    instructions: list[Any] = []
+    user = payload.get("data")
+    if isinstance(user, dict):
+        user = user.get("user")
+    if isinstance(user, dict):
+        user = user.get("result")
+    if isinstance(user, dict):
+        timeline = user.get("timeline") or user.get("timeline_v2")
+        if isinstance(timeline, dict):
+            inner = timeline.get("timeline")
+            if isinstance(inner, dict):
+                found = inner.get("instructions")
+                if isinstance(found, list):
+                    instructions = found
+    results: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    def _collect(candidate: Any, *, pinned: bool) -> None:
+        metrics = _metrics_from_tweet_node(candidate)
+        if metrics is None or metrics["tweet_id"] in seen:
+            return
+        seen.add(metrics["tweet_id"])
+        metrics["pinned"] = pinned
+        results.append(metrics)
+
+    def _collect_entry(entry: Any, *, pinned: bool) -> None:
+        if not isinstance(entry, dict):
+            return
+        content = entry.get("content")
+        if not isinstance(content, dict):
+            return
+        item_content = content.get("itemContent")
+        if not isinstance(item_content, dict):
+            return
+        tweet_results = item_content.get("tweet_results")
+        if isinstance(tweet_results, dict):
+            _collect(tweet_results.get("result"), pinned=pinned)
+
+    for instruction in instructions:
+        if not isinstance(instruction, dict):
+            continue
+        kind = instruction.get("type")
+        if kind == "TimelinePinEntry":
+            _collect_entry(instruction.get("entry"), pinned=True)
+            continue
+        entries = instruction.get("entries")
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            _collect_entry(entry, pinned=False)
+    return results
+
+
+USER_TWEETS_HYDRATION_WAIT_MS = 6_000
+USER_TWEETS_SCROLL_INTERVAL_MS = 7_000
+# X 分页由"滚到底部 sentinel"触发且 GraphQL 响应可能 ~10s 才回，容忍多轮空转
+USER_TWEETS_IDLE_ROUNDS = 4
+
+
+async def fetch_user_tweets_metrics(
+    screen_name: str,
+    state: State,
+    *,
+    until_hours: int = 96,
+    max_scrolls: int = 30,
+    proxy: str | None = None,
+    headless: bool = True,
+) -> list[dict[str, Any]]:
+    """打开用户主页时间线，滚动翻页批量收集近 until_hours 小时推文的指标。
+
+    一次浏览器会话拿全量（对比逐条开推文页，请求量小几个量级）。
+    X 首屏是 SSR/hydration，首个 UserTweets XHR 通常在首次滚动之后才出现，
+    所以采用"固定节拍持续滚动 + 并行收响应"而不是"等响应再滚"。
+    终止条件：非置顶推文已老于时间窗 / 滚动达上限 / 连续多轮无新增。
+    """
+    name = (screen_name or "").strip().lstrip("@")
+    if not name:
+        raise ValueError("screen_name is required")
+    url = f"https://x.com/{name}"
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=until_hours)
+    collected: dict[str, dict[str, Any]] = {}
+    reached_cutoff = False
+    async with sem:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(
+                channel="msedge",
+                proxy=ProxySettings(server=proxy) if proxy else None,
+                headless=headless,
+                executable_path="/usr/bin/chromium",
+                args=[
+                    "--disable-gpu",
+                    "--no-sandbox",
+                    "--enable-unsafe-swiftshader",
+                ],
+            )
+            try:
+                context = await browser.new_context(
+                    storage_state=StorageState(**state.model_dump()), locale="zh-CN"
+                )
+                page = await context.new_page()
+                page.on("console", log_console_message)
+                payloads: asyncio.Queue = asyncio.Queue()
+
+                async def _on_response(response: "Response") -> None:
+                    if not is_user_tweets_response(response):
+                        return
+                    try:
+                        payloads.put_nowait(await response.json())
+                    except Exception as exc:
+                        logger.warning(
+                            "Failed to read UserTweets response: {}",
+                            describe_send_exception(exc),
+                        )
+
+                page.on("response", _on_response)
+                await page.goto(url, wait_until="domcontentloaded", timeout=90_000)
+                await page.wait_for_timeout(USER_TWEETS_HYDRATION_WAIT_MS)
+                idle_rounds = 0
+                for _ in range(max_scrolls):
+                    got_new = False
+                    while True:
+                        try:
+                            payload = payloads.get_nowait()
+                        except asyncio.QueueEmpty:
+                            break
+                        for item in parse_user_tweets_payload(payload):
+                            if item["tweet_id"] in collected:
+                                continue
+                            collected[item["tweet_id"]] = item
+                            got_new = True
+                            if not item.get("pinned"):
+                                ts = parse_tweet_created_at(
+                                    item.get("created_at", "")
+                                )
+                                if ts is not None and ts < cutoff:
+                                    reached_cutoff = True
+                    if reached_cutoff:
+                        break
+                    idle_rounds = 0 if got_new else idle_rounds + 1
+                    if idle_rounds >= USER_TWEETS_IDLE_ROUNDS and collected:
+                        break
+                    # 滚到文档底部才能让虚拟列表的分页 sentinel 进入视口；
+                    # 固定增量 wheel 会被 DOM 回收的高度变化耗散，触发不了下一页。
+                    await page.evaluate(
+                        "window.scrollTo(0, document.documentElement.scrollHeight)"
+                    )
+                    await page.wait_for_timeout(USER_TWEETS_SCROLL_INTERVAL_MS)
+                logger.info(
+                    "UserTweets collect for @{}: {} tweets (cutoff_reached={})",
+                    name,
+                    len(collected),
+                    reached_cutoff,
+                )
+            finally:
+                try:
+                    await asyncio.wait_for(
+                        browser.close(), timeout=BROWSER_CLOSE_TIMEOUT_SECONDS
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to close browser cleanly: {}",
+                        describe_send_exception(exc),
+                    )
+
+    def _sort_key(item: dict[str, Any]):
+        ts = parse_tweet_created_at(item.get("created_at", ""))
+        return ts or datetime.fromtimestamp(0, tz=timezone.utc)
+
+    return sorted(collected.values(), key=_sort_key, reverse=True)
 
 
 async def fetch_tweet_metrics(
