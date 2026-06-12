@@ -19,6 +19,7 @@ echo "[1/4] rsync repo -> qj:$BUILD_DIR"
 rsync -az --delete \
     --exclude ".git" --exclude ".venv" --exclude "__pycache__" \
     --exclude "data/" --exclude "ss/" --exclude ".env" \
+    --exclude "*state*.json" --exclude "custom-state*" \
     "$REPO_DIR/" "$QJ:$BUILD_DIR/"
 
 echo "[2/4] build on qj"

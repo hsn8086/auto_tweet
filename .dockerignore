@@ -1,0 +1,13 @@
+# 安全红线：state/cookie/数据绝不进 build context（参见 AGENTS.md）
+.git
+.venv
+__pycache__
+*.pyc
+.env
+data/
+ss/
+*state*.json
+custom-state*.json
+*.bak*
+scripts/
+tests/
