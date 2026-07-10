@@ -67,6 +67,33 @@ class ResultStoreTests(unittest.TestCase):
         assert entry is not None
         self.assertEqual(len(entry["error"]), 2000)
 
+    def test_claim_is_atomic_and_reclaims_only_failed_or_stale(self) -> None:
+        first = self.store.claim("claim-1", stale_seconds=60)
+        active = self.store.claim("claim-1", stale_seconds=60)
+        self.assertEqual(first.outcome, "claimed")
+        self.assertEqual(active.outcome, "active")
+
+        self.store.record("claim-1", STATUS_SUCCESS, tweet_id="9")
+        replay = self.store.claim("claim-1", stale_seconds=60)
+        self.assertEqual(replay.outcome, "replay")
+        assert replay.entry is not None
+        self.assertEqual(replay.entry["tweet_id"], "9")
+
+        self.store.record("claim-2", STATUS_FAILED, error="retry")
+        self.assertEqual(
+            self.store.claim("claim-2", stale_seconds=60).outcome, "claimed"
+        )
+
+        self.store.record("claim-3", STATUS_RUNNING)
+        stale_path = Path(self._tmp.name) / "claim-3.json"
+        entry = self.store.get("claim-3")
+        assert entry is not None
+        entry["updated_at"] = time.time() - 120
+        stale_path.write_text(__import__("json").dumps(entry), encoding="utf-8")
+        self.assertEqual(
+            self.store.claim("claim-3", stale_seconds=60).outcome, "claimed"
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

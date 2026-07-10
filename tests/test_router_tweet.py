@@ -1,4 +1,7 @@
+import asyncio
 import unittest
+import json
+from concurrent.futures import ThreadPoolExecutor
 from os import environ
 from unittest.mock import ANY
 from unittest.mock import AsyncMock, patch
@@ -13,6 +16,25 @@ def _build_client() -> TestClient:
     app = FastAPI()
     app.include_router(router, prefix="/api/v1")
     return TestClient(app)
+
+
+def _state_json(user_id: str) -> str:
+    return json.dumps(
+        {
+            "cookies": [
+                {
+                    "name": "twid",
+                    "value": f"u%3D{user_id}",
+                    "domain": ".x.com",
+                    "path": "/",
+                    "expires": -1,
+                    "httpOnly": False,
+                    "secure": True,
+                    "sameSite": "None",
+                }
+            ]
+        }
+    )
 
 
 class TweetRouterTests(unittest.TestCase):
@@ -270,9 +292,7 @@ class TweetReconcileTests(unittest.TestCase):
         self._tmp.cleanup()
 
     @patch("src.router.tweet.send", new_callable=AsyncMock)
-    def test_success_result_is_stored_and_queryable(
-        self, mock_send: AsyncMock
-    ) -> None:
+    def test_success_result_is_stored_and_queryable(self, mock_send: AsyncMock) -> None:
         mock_send.return_value = "9876"
         client = _build_client()
 
@@ -396,3 +416,200 @@ class TweetReconcileTests(unittest.TestCase):
         body = response.json()
         self.assertIn("waiting", body)
         self.assertIn("active", body)
+
+    @patch("src.router.tweet.send", new_callable=AsyncMock)
+    def test_concurrent_same_request_id_sends_once(self, mock_send: AsyncMock) -> None:
+        async def slow_send(*_args, **_kwargs) -> str:
+            await asyncio.sleep(0.2)
+            return "444"
+
+        mock_send.side_effect = slow_send
+
+        def post_once() -> tuple[int, dict]:
+            response = _build_client().post(
+                "/api/v1/tweet/post",
+                data={"state": '{"cookies": []}', "request_id": "same-request"},
+                files={"images": ("test.jpg", b"img", "image/jpeg")},
+            )
+            return response.status_code, response.json()
+
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            results = list(executor.map(lambda _index: post_once(), range(2)))
+
+        self.assertEqual(sorted(status for status, _body in results), [200, 409])
+        self.assertEqual(mock_send.await_count, 1)
+
+
+class TweetReplyRouterTests(unittest.TestCase):
+    def setUp(self) -> None:
+        import tempfile
+
+        self._tmp = tempfile.TemporaryDirectory()
+        environ["DATA_DIR"] = self._tmp.name
+        from src import result_store
+
+        result_store._stores.clear()
+
+    def tearDown(self) -> None:
+        environ.pop("DATA_DIR", None)
+        environ.pop("AUTO_TWEET_API_KEY", None)
+        self._tmp.cleanup()
+
+    @patch("src.router.tweet.send", new_callable=AsyncMock)
+    def test_pure_image_reply_and_idempotent_replay(self, mock_send: AsyncMock) -> None:
+        mock_send.return_value = "777"
+        client = _build_client()
+        data = {
+            "state": _state_json("10"),
+            "expected_user_id": "10",
+            "in_reply_to_tweet_id": "123",
+            "request_id": "reply-1",
+        }
+
+        first = client.post(
+            "/api/v1/tweet/reply",
+            data=data,
+            files={"images": ("image.jpg", b"image", "image/jpeg")},
+        )
+        second = client.post(
+            "/api/v1/tweet/reply",
+            data=data,
+            files={"images": ("image.jpg", b"image", "image/jpeg")},
+        )
+
+        self.assertEqual(first.status_code, 200)
+        self.assertEqual(first.json()["tweet_id"], "777")
+        self.assertEqual(
+            second.json(),
+            {"status": "ok", "replayed": True, "tweet_id": "777"},
+        )
+        mock_send.assert_awaited_once_with(
+            "",
+            ANY,
+            media=ANY,
+            proxy=ANY,
+            headless=True,
+            reply_to_tweet_id="123",
+        )
+
+    @patch("src.router.tweet.send", new_callable=AsyncMock)
+    def test_reply_rejects_wrong_viewer_before_sender(
+        self, mock_send: AsyncMock
+    ) -> None:
+        client = _build_client()
+
+        response = client.post(
+            "/api/v1/tweet/reply",
+            data={
+                "state": _state_json("11"),
+                "expected_user_id": "10",
+                "in_reply_to_tweet_id": "123",
+                "request_id": "wrong-viewer",
+                "context": "hello",
+            },
+        )
+
+        self.assertEqual(response.status_code, 409)
+        mock_send.assert_not_awaited()
+
+    @patch("src.router.tweet.send", new_callable=AsyncMock)
+    def test_reply_rejects_more_than_four_images(self, mock_send: AsyncMock) -> None:
+        client = _build_client()
+        files = [
+            ("images", (f"{index}.jpg", b"image", "image/jpeg")) for index in range(5)
+        ]
+
+        response = client.post(
+            "/api/v1/tweet/reply",
+            data={
+                "state": _state_json("10"),
+                "expected_user_id": "10",
+                "in_reply_to_tweet_id": "123",
+                "request_id": "too-many-images",
+            },
+            files=files,
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("4", response.json()["detail"])
+        mock_send.assert_not_awaited()
+
+
+class VerifiedRepliesRouterTests(unittest.TestCase):
+    def tearDown(self) -> None:
+        environ.pop("AUTO_TWEET_API_KEY", None)
+
+    @patch("src.router.tweet.fetch_verified_replies", new_callable=AsyncMock)
+    def test_verified_replies_normalizes_parameters(
+        self, mock_fetch: AsyncMock
+    ) -> None:
+        mock_fetch.return_value = {
+            "newest_id": "900",
+            "observed_newest_id": "900",
+            "complete": True,
+            "replies": [{"tweet_id": "900"}],
+        }
+        client = _build_client()
+
+        response = client.post(
+            "/api/v1/tweet/verified_replies",
+            data={
+                "state": _state_json("10"),
+                "screen_name": "@Target_User",
+                "expected_user_id": "10",
+                "since_id": "800",
+                "since_time": "2026-07-10T10:00:00Z",
+                "parent_window_hours": "24",
+                "max_scrolls": "0",
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.json(),
+            {
+                "status": "ok",
+                "screen_name": "Target_User",
+                "viewer_user_id": "10",
+                "newest_id": "900",
+                "observed_newest_id": "900",
+                "complete": True,
+                "replies": [{"tweet_id": "900"}],
+            },
+        )
+        args = mock_fetch.await_args
+        self.assertIsNotNone(args)
+        assert args is not None
+        self.assertEqual(args.args[:2], ("Target_User", "10"))
+        self.assertEqual(args.kwargs["since_id"], "800")
+        self.assertEqual(args.kwargs["parent_window_hours"], 24)
+        self.assertEqual(args.kwargs["max_scrolls"], 0)
+
+    @patch("src.router.tweet.fetch_verified_replies", new_callable=AsyncMock)
+    def test_verified_replies_requires_api_key_and_matching_viewer(
+        self, mock_fetch: AsyncMock
+    ) -> None:
+        environ["AUTO_TWEET_API_KEY"] = "secret"
+        client = _build_client()
+
+        unauthorized = client.post(
+            "/api/v1/tweet/verified_replies",
+            data={
+                "state": _state_json("10"),
+                "screen_name": "target",
+                "expected_user_id": "10",
+            },
+        )
+        wrong_viewer = client.post(
+            "/api/v1/tweet/verified_replies",
+            headers={"X-Auto-Tweet-Key": "secret"},
+            data={
+                "state": _state_json("11"),
+                "screen_name": "target",
+                "expected_user_id": "10",
+            },
+        )
+
+        self.assertEqual(unauthorized.status_code, 401)
+        self.assertEqual(wrong_viewer.status_code, 409)
+        mock_fetch.assert_not_awaited()

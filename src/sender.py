@@ -1,4 +1,5 @@
 import asyncio
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any
 
@@ -22,6 +23,13 @@ from tenacity import (
 )
 
 from .model import PostSentError, State
+from .replies import (
+    filter_verified_replies,
+    newest_tweet_id,
+    parse_datetime,
+    parse_graphql_tweets,
+    reached_since,
+)
 
 sem = asyncio.Semaphore(1)
 # 仅用于可观测性（/tweet/queue）：当前排队/执行中的发送数。
@@ -54,6 +62,7 @@ def is_login_bounce_url(url: str) -> bool:
     bare = u.split("?", 1)[0].rstrip("/")
     # 登出状态下 /home 会被重定向到裸域首页
     return bare in ("https://x.com", "https://twitter.com")
+
 
 if TYPE_CHECKING:
     from playwright.async_api import Page
@@ -230,7 +239,7 @@ def _metrics_from_tweet_node(candidate: Any) -> dict[str, Any] | None:
     }
 
 
-def is_user_tweets_response(response: "Response") -> bool:
+def is_user_tweets_response(response: Any) -> bool:
     # 兼容 UserTweets / UserTweetsAndReplies（X 改版时 operation 名可能切换）
     if "UserTweets" not in response.url:
         return False
@@ -318,6 +327,220 @@ USER_TWEETS_SCROLL_INTERVAL_MS = 7_000
 USER_TWEETS_IDLE_ROUNDS = 4
 
 
+@dataclass(frozen=True)
+class TimelineCollection:
+    tweets: list[dict[str, Any]]
+    complete: bool
+    boundary_reached: bool
+
+
+def is_replies_timeline_response(response: "Response") -> bool:
+    if not any(
+        operation in response.url
+        for operation in ("UserTweetsAndReplies", "NotificationsTimeline")
+    ):
+        return False
+    try:
+        return response.request.method == "GET"
+    except Exception:
+        return False
+
+
+async def _collect_replies_timeline(
+    context: Any,
+    url: str,
+    *,
+    max_scrolls: int,
+    since_id: str | None = None,
+    since_time: datetime | None = None,
+    oldest_time: datetime | None = None,
+    boundary_reply_to_user_id: str | None = None,
+    boundary_author_user_id: str | None = None,
+) -> TimelineCollection:
+    page = await context.new_page()
+    page.on("console", log_console_message)
+    payloads: asyncio.Queue[Any] = asyncio.Queue()
+
+    async def _on_response(response: "Response") -> None:
+        if not is_replies_timeline_response(response):
+            return
+        try:
+            payloads.put_nowait(await response.json())
+        except Exception as exc:
+            logger.warning(
+                "Failed to read replies timeline response: {}",
+                describe_send_exception(exc),
+            )
+
+    page.on("response", _on_response)
+    collected: dict[str, dict[str, Any]] = {}
+    idle_rounds = 0
+    reached_boundary = False
+    complete = False
+
+    def collect_payload(payload: Any) -> bool:
+        nonlocal reached_boundary
+        got_new = False
+        parsed = parse_graphql_tweets(payload)
+        since_candidates = parsed
+        if boundary_reply_to_user_id is not None:
+            since_candidates = [
+                item
+                for item in parsed
+                if item.get("in_reply_to_user_id") == boundary_reply_to_user_id
+            ]
+        if reached_since(since_candidates, since_id=since_id, since_time=since_time):
+            reached_boundary = True
+        oldest_candidates = parsed
+        if boundary_author_user_id is not None:
+            oldest_candidates = [
+                item
+                for item in parsed
+                if item.get("author", {}).get("user_id") == boundary_author_user_id
+                and not item.get("_pinned")
+            ]
+        if oldest_time is not None and any(
+            (created := parse_datetime(str(item.get("created_at") or ""))) is not None
+            and created <= oldest_time
+            for item in oldest_candidates
+        ):
+            reached_boundary = True
+        for item in parsed:
+            tweet_id = str(item["tweet_id"])
+            if tweet_id not in collected:
+                collected[tweet_id] = item
+                got_new = True
+        return got_new
+
+    try:
+        await page.goto(url, wait_until="domcontentloaded", timeout=90_000)
+        await page.wait_for_timeout(USER_TWEETS_HYDRATION_WAIT_MS)
+        scrolls = 0
+        while True:
+            got_new = False
+            while True:
+                try:
+                    payload = payloads.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                got_new = collect_payload(payload) or got_new
+            if reached_boundary:
+                complete = True
+                break
+            idle_rounds = 0 if got_new else idle_rounds + 1
+            if idle_rounds >= USER_TWEETS_IDLE_ROUNDS:
+                complete = True
+                break
+            if max_scrolls > 0 and scrolls >= max_scrolls:
+                break
+            await page.evaluate(
+                "window.scrollTo(0, document.documentElement.scrollHeight)"
+            )
+            scrolls += 1
+            await page.wait_for_timeout(USER_TWEETS_SCROLL_INTERVAL_MS)
+        while True:
+            try:
+                payload = payloads.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            collect_payload(payload)
+        if reached_boundary:
+            complete = True
+        return TimelineCollection(
+            tweets=list(collected.values()),
+            complete=complete,
+            boundary_reached=reached_boundary,
+        )
+    finally:
+        await page.close()
+
+
+async def fetch_verified_replies(
+    screen_name: str,
+    expected_user_id: str,
+    state: State,
+    *,
+    since_id: str | None = None,
+    since_time: datetime | None = None,
+    parent_window_hours: int = 48,
+    max_scrolls: int = 0,
+    proxy: str | None = None,
+    headless: bool = True,
+) -> dict[str, Any]:
+    """Collect verified direct replies and hydrate their parent tweets."""
+    name = screen_name.strip().lstrip("@")
+    parent_cutoff = datetime.now(timezone.utc) - timedelta(hours=parent_window_hours)
+    async with sem:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(
+                channel="msedge",
+                proxy=ProxySettings(server=proxy) if proxy else None,
+                headless=headless,
+                executable_path="/usr/bin/chromium",
+                args=[
+                    "--disable-gpu",
+                    "--no-sandbox",
+                    "--enable-unsafe-swiftshader",
+                ],
+            )
+            try:
+                context = await browser.new_context(
+                    storage_state=StorageState(**state.model_dump()), locale="zh-CN"
+                )
+                profile_tweets = await _collect_replies_timeline(
+                    context,
+                    f"https://x.com/{name}/with_replies",
+                    max_scrolls=max_scrolls,
+                    oldest_time=parent_cutoff,
+                    boundary_author_user_id=expected_user_id,
+                )
+                notification_tweets = await _collect_replies_timeline(
+                    context,
+                    "https://x.com/notifications/verified",
+                    max_scrolls=max_scrolls,
+                    since_id=since_id,
+                    since_time=since_time,
+                    boundary_reply_to_user_id=expected_user_id,
+                )
+                merged = {str(item["tweet_id"]): item for item in profile_tweets.tweets}
+                for item in notification_tweets.tweets:
+                    merged.setdefault(str(item["tweet_id"]), item)
+                replies = filter_verified_replies(
+                    list(merged.values()),
+                    expected_user_id=expected_user_id,
+                    parent_window_hours=parent_window_hours,
+                    since_id=since_id,
+                    since_time=since_time,
+                    candidate_reply_ids={
+                        str(item["tweet_id"]) for item in notification_tweets.tweets
+                    },
+                )
+                complete = profile_tweets.complete and notification_tweets.complete
+                observed_newest_id = newest_tweet_id(notification_tweets.tweets)
+                logger.info(
+                    "Verified replies collect for @{} user_id={}: {} replies",
+                    name,
+                    expected_user_id,
+                    len(replies),
+                )
+                return {
+                    "newest_id": observed_newest_id,
+                    "observed_newest_id": observed_newest_id,
+                    "complete": complete,
+                    "replies": replies,
+                }
+            finally:
+                try:
+                    await asyncio.wait_for(
+                        browser.close(), timeout=BROWSER_CLOSE_TIMEOUT_SECONDS
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to close browser cleanly: {}",
+                        describe_send_exception(exc),
+                    )
+
+
 async def fetch_user_tweets_metrics(
     screen_name: str,
     state: State,
@@ -390,9 +613,7 @@ async def fetch_user_tweets_metrics(
                             collected[item["tweet_id"]] = item
                             got_new = True
                             if not item.get("pinned"):
-                                ts = parse_tweet_created_at(
-                                    item.get("created_at", "")
-                                )
+                                ts = parse_tweet_created_at(item.get("created_at", ""))
                                 if ts is not None and ts < cutoff:
                                     reached_cutoff = True
                     if reached_cutoff:
@@ -612,6 +833,14 @@ def post_button_candidates(page: "Page") -> list[Locator]:
     ]
 
 
+def reply_button_candidates(page: "Page") -> list[Locator]:
+    return [
+        page.get_by_test_id("tweetButton"),
+        page.get_by_role("button", name="回复"),
+        page.get_by_role("button", name="Reply"),
+    ]
+
+
 def media_back_candidates(page: "Page") -> list[Locator]:
     return [
         page.get_by_label("返回"),
@@ -751,6 +980,25 @@ async def open_post_composer(page: "Page") -> Locator:
     ) from last_error
 
 
+async def open_reply_composer(page: "Page", tweet_id: str) -> Locator:
+    await page.goto(
+        f"https://x.com/i/web/status/{tweet_id}",
+        wait_until="domcontentloaded",
+        timeout=90_000,
+    )
+    target_tweet = page.locator(f"article:has(a[href*='/status/{tweet_id}'])").first
+    await click_e(
+        target_tweet.get_by_test_id("reply"),
+        timeout=45,
+        description="target tweet reply button",
+    )
+    composer = await wait_first_available(
+        composer_candidates(page), timeout=45, description="reply composer"
+    )
+    await click_e(composer, timeout=30, description="reply composer")
+    return composer
+
+
 @retry(
     stop=stop_after_attempt(5),
     wait=wait_exponential(multiplier=1, min=2, max=30),
@@ -766,6 +1014,7 @@ async def send(
     headless=True,
     spoiler=False,
     made_with_ai=False,
+    reply_to_tweet_id: str | None = None,
 ) -> str | None:
     if not media:
         media = []
@@ -818,8 +1067,12 @@ async def send(
                         pass
 
                 page.on("request", _on_request)
-                composer = await open_post_composer(page)
-                post_buttons = post_button_candidates(page)
+                if reply_to_tweet_id:
+                    composer = await open_reply_composer(page, reply_to_tweet_id)
+                    post_buttons = reply_button_candidates(page)
+                else:
+                    composer = await open_post_composer(page)
+                    post_buttons = post_button_candidates(page)
 
                 first = True
                 for medium in media:
@@ -887,9 +1140,10 @@ async def send(
                 await click_e(composer, timeout=30, description="post composer")
                 await composer.wait_for(state="attached")
                 await composer.focus()
-                await composer.fill(txt + "\n")
+                if txt:
+                    await composer.fill(txt + "\n")
 
-                logger.info("Posting...")
+                logger.info("Sending {}...", "reply" if reply_to_tweet_id else "post")
                 try:
                     async with page.expect_response(
                         is_create_tweet_response,
@@ -925,7 +1179,16 @@ async def send(
                     )
 
                 await take_debug_screenshot(page, "ss/3.png")
-                logger.info("Post sent.")
+                if posted or create_tweet_dispatched:
+                    raise PostSentError(
+                        "CreateTweet 已发出但未能确认 tweet_id", tweet_id=tweet_id
+                    )
+            except asyncio.CancelledError as exc:
+                if posted or create_tweet_dispatched:
+                    raise PostSentError(
+                        "CreateTweet 已发出但发送任务被取消", tweet_id=tweet_id
+                    ) from exc
+                raise
             except Exception as e:
                 if posted or create_tweet_dispatched:
                     detail = describe_send_exception(e)

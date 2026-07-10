@@ -11,7 +11,9 @@ import os
 import re
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal
 
 REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
 
@@ -24,6 +26,12 @@ TERMINAL_SENT_STATUSES = {STATUS_SUCCESS, STATUS_SENT_UNCONFIRMED}
 
 DEFAULT_TTL_SECONDS = 7 * 24 * 3600
 _CLEANUP_MIN_INTERVAL_SECONDS = 600
+
+
+@dataclass(frozen=True)
+class ClaimResult:
+    outcome: Literal["claimed", "replay", "active"]
+    entry: dict | None = None
 
 
 def is_valid_request_id(request_id: str) -> bool:
@@ -66,17 +74,41 @@ class ResultStore:
         if error:
             entry["error"] = error[:2000]
         path = self._path(request_id)
-        tmp_path = path.with_suffix(".json.tmp")
         with self._lock:
-            tmp_path.write_text(
-                json.dumps(entry, ensure_ascii=False), encoding="utf-8"
-            )
-            os.replace(tmp_path, path)
+            self._write_path(path, entry)
         self._maybe_cleanup()
         return entry
 
+    def claim(self, request_id: str, stale_seconds: float) -> ClaimResult:
+        """Atomically claim a request id or report its existing send state."""
+        path = self._path(request_id)
+        with self._lock:
+            existing = self._read_path(path)
+            if existing is not None:
+                status = existing.get("status")
+                if status in TERMINAL_SENT_STATUSES:
+                    return ClaimResult("replay", existing)
+                updated_at = existing.get("updated_at")
+                stale = not isinstance(updated_at, (int, float)) or (
+                    time.time() - updated_at > stale_seconds
+                )
+                if status == STATUS_RUNNING and not stale:
+                    return ClaimResult("active", existing)
+            entry: dict[str, object] = {
+                "request_id": request_id,
+                "status": STATUS_RUNNING,
+                "updated_at": time.time(),
+            }
+            self._write_path(path, entry)
+        self._maybe_cleanup()
+        return ClaimResult("claimed", entry)
+
     def get(self, request_id: str) -> dict | None:
         path = self._path(request_id)
+        return self._read_path(path)
+
+    @staticmethod
+    def _read_path(path: Path) -> dict | None:
         try:
             raw = path.read_text(encoding="utf-8")
         except FileNotFoundError:
@@ -86,6 +118,12 @@ class ResultStore:
         except json.JSONDecodeError:
             return None
         return entry if isinstance(entry, dict) else None
+
+    @staticmethod
+    def _write_path(path: Path, entry: dict[str, object]) -> None:
+        tmp_path = path.with_suffix(".json.tmp")
+        tmp_path.write_text(json.dumps(entry, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp_path, path)
 
     def _maybe_cleanup(self) -> None:
         now = time.time()

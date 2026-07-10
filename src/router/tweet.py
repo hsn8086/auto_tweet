@@ -1,5 +1,6 @@
-from typing import Annotated
+from typing import Annotated, Awaitable
 import asyncio
+import re
 import secrets
 
 from fastapi import APIRouter, UploadFile, File, HTTPException, Form, Header, Query
@@ -10,21 +11,28 @@ from tenacity import RetryError
 
 from ..config import Config
 from ..model import State, PostSentError
+from ..replies import parse_datetime, parse_viewer_user_id
 from ..result_store import (
+    ResultStore,
     STATUS_FAILED,
-    STATUS_RUNNING,
     STATUS_SENT_UNCONFIRMED,
     STATUS_SUCCESS,
-    TERMINAL_SENT_STATUSES,
     get_result_store,
     is_valid_request_id,
 )
-from ..sender import RETRYABLE_SEND_EXCEPTIONS, describe_send_exception, send
+from ..sender import (
+    RETRYABLE_SEND_EXCEPTIONS,
+    describe_send_exception,
+    fetch_verified_replies,
+    send,
+)
 
 router = APIRouter(prefix="/tweet")
 SEND_TIMEOUT_SECONDS = 60 * 25
 # running 记录超过该时长视为陈旧（进程曾中途崩溃/重启），允许重试覆盖。
 STALE_RUNNING_SECONDS = SEND_TIMEOUT_SECONDS + 5 * 60
+VERIFIED_REPLIES_TIMEOUT_SECONDS = 60 * 45
+_SCREEN_NAME_RE = re.compile(r"^[A-Za-z0-9_]{1,15}$")
 
 
 def _require_api_key(config: Config, request_key: str | None) -> None:
@@ -49,15 +57,6 @@ def _normalize_request_id(request_id: str | None) -> str | None:
     return request_id
 
 
-def _is_stale_running(entry: dict) -> bool:
-    updated_at = entry.get("updated_at")
-    if not isinstance(updated_at, (int, float)):
-        return True
-    import time
-
-    return time.time() - updated_at > STALE_RUNNING_SECONDS
-
-
 def _replay_payload(entry: dict) -> dict[str, object]:
     payload: dict[str, object] = {"status": "ok", "replayed": True}
     tweet_id = entry.get("tweet_id")
@@ -67,6 +66,124 @@ def _replay_payload(entry: dict) -> dict[str, object]:
     if isinstance(warning, str) and warning:
         payload["warning"] = warning
     return payload
+
+
+def _claim_send(
+    config: Config, request_id: str | None
+) -> tuple[ResultStore | None, dict[str, object] | None]:
+    if request_id is None:
+        return None, None
+    store = get_result_store(config.data_dir + "/tweet_results")
+    claim = store.claim(request_id, STALE_RUNNING_SECONDS)
+    if claim.outcome == "replay" and claim.entry is not None:
+        logger.info(
+            "Replaying stored result for request_id={} status={}",
+            request_id,
+            claim.entry.get("status"),
+        )
+        return store, _replay_payload(claim.entry)
+    if claim.outcome == "active":
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"该 request_id 仍在处理中，请通过 /tweet/result/{request_id} 轮询结果"
+            ),
+        )
+    return store, None
+
+
+async def _read_images(
+    images: list[UploadFile] | None, *, max_images: int | None = None
+) -> list[FilePayload]:
+    uploads = images or []
+    if max_images is not None and len(uploads) > max_images:
+        raise HTTPException(status_code=400, detail=f"最多允许上传 {max_images} 张图片")
+    payloads: list[FilePayload] = []
+    for image in uploads:
+        if not image.filename or not image.content_type:
+            raise HTTPException(status_code=400, detail="图片缺少文件名或类型")
+        payloads.append(
+            FilePayload(
+                name=image.filename,
+                mimeType=image.content_type,
+                buffer=await image.read(),
+            )
+        )
+    return payloads
+
+
+async def _execute_send(
+    operation: Awaitable[str | None],
+    *,
+    request_id: str | None,
+    store: ResultStore | None,
+    operation_name: str,
+) -> dict[str, object]:
+    try:
+        tweet_id = await asyncio.wait_for(operation, timeout=SEND_TIMEOUT_SECONDS)
+        payload: dict[str, object] = {"status": "ok"}
+        if isinstance(tweet_id, str) and tweet_id:
+            payload["tweet_id"] = tweet_id
+        if request_id and store is not None:
+            store.record(
+                request_id,
+                STATUS_SUCCESS,
+                tweet_id=tweet_id if isinstance(tweet_id, str) else None,
+            )
+        return payload
+    except PostSentError as exc:
+        warning = describe_send_exception(exc)
+        payload = {"status": "ok", "warning": warning}
+        if exc.tweet_id:
+            payload["tweet_id"] = exc.tweet_id
+        if request_id and store is not None:
+            store.record(
+                request_id,
+                STATUS_SENT_UNCONFIRMED,
+                tweet_id=exc.tweet_id,
+                warning=warning,
+            )
+        return payload
+    except RETRYABLE_SEND_EXCEPTIONS as exc:
+        detail = describe_send_exception(exc)
+        logger.warning("Retriable error in {}: {}", operation_name, detail)
+        if request_id and store is not None:
+            store.record(request_id, STATUS_FAILED, error=detail)
+        raise HTTPException(status_code=502, detail=detail)
+    except RetryError as exc:
+        detail = describe_send_exception(exc)
+        logger.warning("RetryError in {}: {}", operation_name, detail)
+        if request_id and store is not None:
+            store.record(request_id, STATUS_FAILED, error=detail)
+        raise HTTPException(status_code=502, detail=detail)
+    except Exception as exc:
+        detail = describe_send_exception(exc)
+        logger.error("Unexpected error in {}: {}", operation_name, detail)
+        if request_id and store is not None:
+            store.record(request_id, STATUS_FAILED, error=detail)
+        raise HTTPException(status_code=500, detail=detail)
+
+
+def _validate_state(raw_state: str) -> State:
+    try:
+        return State.model_validate_json(raw_state)
+    except ValidationError:
+        raise HTTPException(status_code=400, detail="无效的 state 参数")
+
+
+def _validate_expected_user(state: State, expected_user_id: str) -> str:
+    expected = expected_user_id.strip()
+    if not expected.isdigit():
+        raise HTTPException(status_code=400, detail="expected_user_id 必须为数字")
+    try:
+        viewer_user_id = parse_viewer_user_id(state)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    if viewer_user_id != expected:
+        raise HTTPException(
+            status_code=409, detail="state 登录账号与 expected_user_id 不匹配"
+        )
+    return viewer_user_id
 
 
 @router.post("/post")
@@ -100,106 +217,144 @@ async def post_tweet(
     request_id = _normalize_request_id(
         request_id_form if request_id_form is not None else request_id_query
     )
-    store = (
-        get_result_store(config.data_dir + "/tweet_results") if request_id else None
+    state_pyd = _validate_state(state)
+    imgs = await _read_images(images)
+    store, replay = _claim_send(config, request_id)
+    if replay is not None:
+        return replay
+    return await _execute_send(
+        send(
+            context,
+            state_pyd,
+            media=imgs,
+            proxy=config.proxy,
+            spoiler=spoiler,
+            made_with_ai=made_with_ai,
+            headless=True,
+        ),
+        request_id=request_id,
+        store=store,
+        operation_name="post_tweet",
     )
-    if request_id and store is not None:
-        existing = store.get(request_id)
-        if existing:
-            existing_status = existing.get("status")
-            if existing_status in TERMINAL_SENT_STATUSES:
-                # 幂等回放：同 request_id 已发出过，绝不二次发帖。
-                logger.info(
-                    "Replaying stored result for request_id={} status={}",
-                    request_id,
-                    existing_status,
-                )
-                return _replay_payload(existing)
-            if existing_status == STATUS_RUNNING and not _is_stale_running(existing):
-                raise HTTPException(
-                    status_code=409,
-                    detail=(
-                        "该 request_id 仍在处理中，请通过 "
-                        f"/tweet/result/{request_id} 轮询结果"
-                    ),
-                )
-            # failed 或陈旧 running：允许重试，覆盖记录。
 
-    if not images:
-        images = []
-    try:
-        state_pyd = State.model_validate_json(state)
-    except ValidationError as e:
-        raise HTTPException(status_code=400, detail=f"无效的 state 参数: {e}")
 
-    imgs = []
-    for image in images:
-        if not image.filename or not image.content_type:
-            raise HTTPException(status_code=400, detail="图片缺少文件名或类型")
-        img = FilePayload(
-            name=image.filename,
-            mimeType=image.content_type,
-            buffer=await image.read(),
+@router.post("/reply")
+async def reply_tweet(
+    state_form: Annotated[str | None, Form(alias="state")] = None,
+    expected_user_id_form: Annotated[str | None, Form(alias="expected_user_id")] = None,
+    in_reply_to_tweet_id_form: Annotated[
+        str | None, Form(alias="in_reply_to_tweet_id")
+    ] = None,
+    context_form: Annotated[str | None, Form(alias="context")] = None,
+    request_id_form: Annotated[str | None, Form(alias="request_id")] = None,
+    api_key: Annotated[str | None, Header(alias="X-Auto-Tweet-Key")] = None,
+    images: list[UploadFile] | None = File(None),
+):
+    config = Config()
+    _require_api_key(config, api_key)
+    if state_form is None:
+        raise HTTPException(status_code=400, detail="缺少 state 参数")
+    if not expected_user_id_form:
+        raise HTTPException(status_code=400, detail="缺少 expected_user_id 参数")
+    target_tweet_id = (in_reply_to_tweet_id_form or "").strip()
+    if not target_tweet_id.isdigit():
+        raise HTTPException(status_code=400, detail="in_reply_to_tweet_id 必须为数字")
+    request_id = _normalize_request_id(request_id_form)
+    if request_id is None:
+        raise HTTPException(status_code=400, detail="request_id 为必填")
+    state_pyd = _validate_state(state_form)
+    _validate_expected_user(state_pyd, expected_user_id_form)
+    imgs = await _read_images(images, max_images=4)
+    context = context_form or ""
+    if not context.strip() and not imgs:
+        raise HTTPException(status_code=400, detail="context 和 images 至少提供一项")
+    store, replay = _claim_send(config, request_id)
+    if replay is not None:
+        return replay
+    return await _execute_send(
+        send(
+            context,
+            state_pyd,
+            media=imgs,
+            proxy=config.proxy,
+            headless=True,
+            reply_to_tweet_id=target_tweet_id,
+        ),
+        request_id=request_id,
+        store=store,
+        operation_name="reply_tweet",
+    )
+
+
+@router.post("/verified_replies")
+async def verified_replies(
+    state_form: Annotated[str | None, Form(alias="state")] = None,
+    screen_name_form: Annotated[str | None, Form(alias="screen_name")] = None,
+    expected_user_id_form: Annotated[str | None, Form(alias="expected_user_id")] = None,
+    since_id_form: Annotated[str | None, Form(alias="since_id")] = None,
+    since_time_form: Annotated[str | None, Form(alias="since_time")] = None,
+    parent_window_hours_form: Annotated[int, Form(alias="parent_window_hours")] = 48,
+    max_scrolls_form: Annotated[int, Form(alias="max_scrolls")] = 0,
+    api_key: Annotated[str | None, Header(alias="X-Auto-Tweet-Key")] = None,
+):
+    config = Config()
+    _require_api_key(config, api_key)
+    if state_form is None or not screen_name_form or not expected_user_id_form:
+        raise HTTPException(
+            status_code=400,
+            detail="state、screen_name 和 expected_user_id 都是必填",
         )
-        imgs.append(img)
-
-    if request_id and store is not None:
-        store.record(request_id, STATUS_RUNNING)
-
+    screen_name = screen_name_form.strip().lstrip("@")
+    if not _SCREEN_NAME_RE.fullmatch(screen_name):
+        raise HTTPException(status_code=400, detail="无效的 screen_name")
+    since_id = (since_id_form or "").strip() or None
+    if since_id is not None and not since_id.isdigit():
+        raise HTTPException(status_code=400, detail="since_id 必须为数字")
+    since_time = parse_datetime(since_time_form)
+    if since_time_form and since_time is None:
+        raise HTTPException(status_code=400, detail="since_time 必须为 ISO 时间")
+    if not 1 <= parent_window_hours_form <= 24 * 30:
+        raise HTTPException(
+            status_code=400, detail="parent_window_hours 必须在 1 到 720 之间"
+        )
+    if not 0 <= max_scrolls_form <= 60:
+        raise HTTPException(status_code=400, detail="max_scrolls 必须在 0 到 60 之间")
+    state_pyd = _validate_state(state_form)
+    viewer_user_id = _validate_expected_user(state_pyd, expected_user_id_form)
     try:
-        tweet_id = await asyncio.wait_for(
-            send(
-                context,
+        result = await asyncio.wait_for(
+            fetch_verified_replies(
+                screen_name,
+                viewer_user_id,
                 state_pyd,
-                media=imgs,
+                since_id=since_id,
+                since_time=since_time,
+                parent_window_hours=parent_window_hours_form,
+                max_scrolls=max_scrolls_form,
                 proxy=config.proxy,
-                spoiler=spoiler,
-                made_with_ai=made_with_ai,
                 headless=True,
             ),
-            timeout=SEND_TIMEOUT_SECONDS,
+            timeout=VERIFIED_REPLIES_TIMEOUT_SECONDS,
         )
-        payload: dict[str, object] = {"status": "ok"}
-        if isinstance(tweet_id, str) and tweet_id:
-            payload["tweet_id"] = tweet_id
-        if request_id and store is not None:
-            store.record(
-                request_id,
-                STATUS_SUCCESS,
-                tweet_id=tweet_id if isinstance(tweet_id, str) else None,
-            )
-        return payload
-    except PostSentError as e:
-        warning = describe_send_exception(e)
-        payload = {"status": "ok", "warning": warning}
-        if getattr(e, "tweet_id", None):
-            payload["tweet_id"] = e.tweet_id
-        if request_id and store is not None:
-            store.record(
-                request_id,
-                STATUS_SENT_UNCONFIRMED,
-                tweet_id=getattr(e, "tweet_id", None),
-                warning=warning,
-            )
-        return payload
-    except RETRYABLE_SEND_EXCEPTIONS as e:
-        detail = describe_send_exception(e)
-        logger.warning("Retriable error in post_tweet: {}", detail)
-        if request_id and store is not None:
-            store.record(request_id, STATUS_FAILED, error=detail)
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="收集认证回复超时")
+    except RETRYABLE_SEND_EXCEPTIONS as exc:
+        detail = describe_send_exception(exc)
+        logger.warning("Retriable error in verified_replies: {}", detail)
         raise HTTPException(status_code=502, detail=detail)
-    except RetryError as e:
-        detail = describe_send_exception(e)
-        logger.warning("RetryError in post_tweet: {}", detail)
-        if request_id and store is not None:
-            store.record(request_id, STATUS_FAILED, error=detail)
+    except Exception as exc:
+        detail = describe_send_exception(exc)
+        logger.error("Unexpected error in verified_replies: {}", detail)
         raise HTTPException(status_code=502, detail=detail)
-    except Exception as e:
-        detail = describe_send_exception(e)
-        logger.error("Unexpected error in post_tweet: {}", detail)
-        if request_id and store is not None:
-            store.record(request_id, STATUS_FAILED, error=detail)
-        raise HTTPException(status_code=500, detail=detail)
+    return {
+        "status": "ok",
+        "screen_name": screen_name,
+        "viewer_user_id": viewer_user_id,
+        "newest_id": result.get("newest_id"),
+        "observed_newest_id": result.get("observed_newest_id", result.get("newest_id")),
+        "complete": bool(result.get("complete")),
+        "replies": result.get("replies", []),
+    }
 
 
 @router.get("/result/{request_id}")

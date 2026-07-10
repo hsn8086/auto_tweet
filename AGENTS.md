@@ -51,12 +51,15 @@ docker commit auto_tweet-auto-twi-1 auto_tweet-auto-twi:latest   # 固化镜像
 ## 代码地图
 
 - `src/router/tweet.py` — 路由：post（含幂等/对账记录）、result、queue、
-  metrics（单条）、user_metrics（批量时间线，上游日报/加权数据源）
+  reply（幂等回复）、verified_replies（认证回复收件箱）、metrics（单条）、
+  user_metrics（批量时间线，上游日报/加权数据源）
 - `src/sender.py` — Playwright 发送主流程：登录弹跳处理(:47)、composer 打开
   (:open_post_composer)、媒体上传+spoiler、AI 声明、CreateTweet 响应捕获、
-  queue_stats；fetch_user_tweets_metrics（开 profile 页滚动收 UserTweets
+  queue_stats；回复 composer；fetch_verified_replies；fetch_user_tweets_metrics（开 profile 页滚动收 UserTweets
   响应——X 首屏 SSR 首个 XHR 在滚动后才出现、分页必须 scrollTo 文档底部，
   这两个坑别"优化"回去）
 - `src/result_store.py` — request_id → 结果 的文件存储（原子写、TTL 清理）
+- `src/replies.py` — state twid 校验、GraphQL tweet/user/media 归一化、认证直接
+  回复与父推文 48h 过滤
 - `src/model.py` — State/CookieItem/PostSentError
 - `login.py` — 手工登录生成 state JSON（运维用）
