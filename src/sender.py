@@ -2,6 +2,7 @@ import asyncio
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any
+from urllib.parse import urlsplit
 
 from loguru import logger
 from playwright.async_api import (
@@ -332,12 +333,19 @@ class TimelineCollection:
     tweets: list[dict[str, Any]]
     complete: bool
     boundary_reached: bool
+    matched_responses: int
 
 
 def is_replies_timeline_response(response: "Response") -> bool:
     if not any(
         operation in response.url
-        for operation in ("UserTweetsAndReplies", "NotificationsTimeline")
+        for operation in (
+            "UserTweets",
+            "UserTweetsAndReplies",
+            "UserWithProfileTweetsQueryV2",
+            "UserWithProfileTweetsAndRepliesQueryV2",
+            "NotificationsTimeline",
+        )
     ):
         return False
     try:
@@ -356,21 +364,33 @@ async def _collect_replies_timeline(
     oldest_time: datetime | None = None,
     boundary_reply_to_user_id: str | None = None,
     boundary_author_user_id: str | None = None,
+    fallback_author: dict[str, str] | None = None,
 ) -> TimelineCollection:
     page = await context.new_page()
     page.on("console", log_console_message)
     payloads: asyncio.Queue[Any] = asyncio.Queue()
+    matched_responses = 0
+    response_tasks: set[asyncio.Task[None]] = set()
 
-    async def _on_response(response: "Response") -> None:
-        if not is_replies_timeline_response(response):
-            return
+    async def _read_response(response: "Response") -> None:
         try:
-            payloads.put_nowait(await response.json())
+            payload = await response.json()
+            payloads.put_nowait(payload)
         except Exception as exc:
             logger.warning(
                 "Failed to read replies timeline response: {}",
                 describe_send_exception(exc),
             )
+
+    def _on_response(response: "Response") -> asyncio.Task[None] | None:
+        nonlocal matched_responses
+        if not is_replies_timeline_response(response):
+            return None
+        matched_responses += 1
+        task = asyncio.create_task(_read_response(response))
+        response_tasks.add(task)
+        task.add_done_callback(response_tasks.discard)
+        return task
 
     page.on("response", _on_response)
     collected: dict[str, dict[str, Any]] = {}
@@ -381,7 +401,7 @@ async def _collect_replies_timeline(
     def collect_payload(payload: Any) -> bool:
         nonlocal reached_boundary
         got_new = False
-        parsed = parse_graphql_tweets(payload)
+        parsed = parse_graphql_tweets(payload, fallback_author=fallback_author)
         since_candidates = parsed
         if boundary_reply_to_user_id is not None:
             since_candidates = [
@@ -415,7 +435,19 @@ async def _collect_replies_timeline(
     try:
         await page.goto(url, wait_until="domcontentloaded", timeout=90_000)
         await page.wait_for_timeout(USER_TWEETS_HYDRATION_WAIT_MS)
+        try:
+            article_count = await page.locator("article").count()
+        except Exception:
+            article_count = -1
+        logger.info(
+            "X timeline page loaded: requested_path={} final_path={} articles={}",
+            urlsplit(url).path,
+            urlsplit(str(getattr(page, "url", url))).path,
+            article_count,
+        )
         scrolls = 0
+        if response_tasks:
+            await asyncio.gather(*tuple(response_tasks), return_exceptions=True)
         while True:
             got_new = False
             while True:
@@ -450,9 +482,49 @@ async def _collect_replies_timeline(
             tweets=list(collected.values()),
             complete=complete,
             boundary_reached=reached_boundary,
+            matched_responses=matched_responses,
         )
     finally:
+        if response_tasks:
+            await asyncio.gather(*tuple(response_tasks), return_exceptions=True)
         await page.close()
+
+
+async def _collect_replies_timeline_with_retry(
+    context: Any,
+    url: str,
+    *,
+    attempts: int = 3,
+    **kwargs: Any,
+) -> TimelineCollection:
+    last: TimelineCollection | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            last = await _collect_replies_timeline(context, url, **kwargs)
+        except PlaywrightError as exc:
+            logger.warning(
+                "X timeline page failed: path={} attempt={}/{} error={}",
+                urlsplit(url).path,
+                attempt,
+                attempts,
+                describe_send_exception(exc),
+            )
+            if attempt == attempts:
+                raise
+            await asyncio.sleep(2 * attempt)
+            continue
+        if last.matched_responses > 0:
+            return last
+        logger.warning(
+            "X timeline produced no API response: path={} attempt={}/{}",
+            urlsplit(url).path,
+            attempt,
+            attempts,
+        )
+        if attempt < attempts:
+            await asyncio.sleep(2 * attempt)
+    assert last is not None
+    return last
 
 
 async def fetch_verified_replies(
@@ -487,14 +559,18 @@ async def fetch_verified_replies(
                 context = await browser.new_context(
                     storage_state=StorageState(**state.model_dump()), locale="zh-CN"
                 )
-                profile_tweets = await _collect_replies_timeline(
+                profile_tweets = await _collect_replies_timeline_with_retry(
                     context,
-                    f"https://x.com/{name}/with_replies",
+                    f"https://x.com/{name}",
                     max_scrolls=max_scrolls,
                     oldest_time=parent_cutoff,
                     boundary_author_user_id=expected_user_id,
+                    fallback_author={
+                        "user_id": expected_user_id,
+                        "screen_name": name,
+                    },
                 )
-                notification_tweets = await _collect_replies_timeline(
+                notification_tweets = await _collect_replies_timeline_with_retry(
                     context,
                     "https://x.com/notifications/verified",
                     max_scrolls=max_scrolls,
@@ -502,6 +578,21 @@ async def fetch_verified_replies(
                     since_time=since_time,
                     boundary_reply_to_user_id=expected_user_id,
                 )
+                logger.info(
+                    "Verified reply timelines for @{}: profile responses={} tweets={} "
+                    "complete={}; notifications responses={} tweets={} complete={}",
+                    name,
+                    profile_tweets.matched_responses,
+                    len(profile_tweets.tweets),
+                    profile_tweets.complete,
+                    notification_tweets.matched_responses,
+                    len(notification_tweets.tweets),
+                    notification_tweets.complete,
+                )
+                if profile_tweets.matched_responses == 0:
+                    raise RuntimeError("未捕获个人回复时间线响应")
+                if notification_tweets.matched_responses == 0:
+                    raise RuntimeError("未捕获认证通知时间线响应")
                 merged = {str(item["tweet_id"]): item for item in profile_tweets.tweets}
                 for item in notification_tweets.tweets:
                     merged.setdefault(str(item["tweet_id"]), item)

@@ -1,3 +1,4 @@
+import asyncio
 import unittest
 import tempfile
 from datetime import datetime, timedelta, timezone
@@ -32,6 +33,120 @@ class FakeLocator:
 
 
 class SenderHelperTests(unittest.IsolatedAsyncioTestCase):
+    def test_reply_timeline_response_supports_profile_v2_operation(self) -> None:
+        response = type(
+            "Response",
+            (),
+            {
+                "url": (
+                    "https://x.com/i/api/graphql/hash/"
+                    "UserWithProfileTweetsAndRepliesQueryV2"
+                ),
+                "request": type("Request", (), {"method": "GET"})(),
+            },
+        )()
+
+        self.assertTrue(sender.is_replies_timeline_response(cast(Any, response)))
+
+    async def test_timeline_retry_stops_after_first_matched_response(self) -> None:
+        empty = sender.TimelineCollection([], False, False, 0)
+        matched = sender.TimelineCollection([], True, False, 1)
+        with (
+            patch(
+                "src.sender._collect_replies_timeline",
+                AsyncMock(side_effect=[empty, matched]),
+            ) as collect,
+            patch("src.sender.asyncio.sleep", AsyncMock()) as sleep,
+        ):
+            result = await sender._collect_replies_timeline_with_retry(
+                object(), "https://x.com/target", max_scrolls=1
+            )
+
+        self.assertIs(result, matched)
+        self.assertEqual(collect.await_count, 2)
+        sleep.assert_awaited_once_with(2)
+
+    async def test_timeline_retry_recovers_from_navigation_error(self) -> None:
+        matched = sender.TimelineCollection([], True, False, 1)
+        with (
+            patch(
+                "src.sender._collect_replies_timeline",
+                AsyncMock(side_effect=[sender.PlaywrightError("closed"), matched]),
+            ) as collect,
+            patch("src.sender.asyncio.sleep", AsyncMock()) as sleep,
+        ):
+            result = await sender._collect_replies_timeline_with_retry(
+                object(), "https://x.com/target", max_scrolls=1
+            )
+
+        self.assertIs(result, matched)
+        self.assertEqual(collect.await_count, 2)
+        sleep.assert_awaited_once_with(2)
+
+    async def test_timeline_waits_for_async_response_reader_before_close(self) -> None:
+        class Page:
+            def __init__(self) -> None:
+                self.response_handler = None
+                self.closed = False
+
+            def on(self, event: str, handler) -> None:
+                if event == "response":
+                    self.response_handler = handler
+
+            async def goto(self, *_args, **_kwargs) -> None:
+                assert self.response_handler is not None
+                self.response_handler(Response(self))
+
+            async def wait_for_timeout(self, _timeout: int) -> None:
+                pass
+
+            async def evaluate(self, _script: str) -> None:
+                pass
+
+            async def close(self) -> None:
+                self.closed = True
+
+        class Response:
+            url = "https://x.com/i/api/graphql/id/NotificationsTimeline"
+            request = type("Request", (), {"method": "GET"})()
+            status = 200
+
+            def __init__(self, page: Page) -> None:
+                self.page = page
+
+            async def json(self) -> dict[str, bool]:
+                await asyncio.sleep(0)
+                self_test.assertFalse(self.page.closed)
+                return {"ready": True}
+
+        class Context:
+            def __init__(self, page: Page) -> None:
+                self.page = page
+
+            async def new_page(self) -> Page:
+                return self.page
+
+        self_test = self
+        page = Page()
+        parsed = [
+            {
+                "tweet_id": "200",
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "in_reply_to_user_id": "10",
+                "author": {"user_id": "20"},
+            }
+        ]
+        with patch("src.sender.parse_graphql_tweets", return_value=parsed):
+            result = await sender._collect_replies_timeline(
+                cast(Any, Context(page)),
+                "https://x.com/notifications/verified",
+                max_scrolls=1,
+            )
+
+        self.assertTrue(page.closed)
+        self.assertEqual(result.matched_responses, 1)
+        self.assertEqual([item["tweet_id"] for item in result.tweets], ["200"])
+
     async def test_wait_e_returns_messageful_timeout(self) -> None:
         blocked = FakeLocator(enabled=False)
 
@@ -366,7 +481,7 @@ class SenderHelperTests(unittest.IsolatedAsyncioTestCase):
 
         now = datetime.now(timezone.utc)
 
-        def parse(payload: dict[str, int]) -> list[dict[str, Any]]:
+        def parse(payload: dict[str, int], **_kwargs: Any) -> list[dict[str, Any]]:
             tweet_id = "200" if payload["page"] == 1 else "100"
             return [
                 {

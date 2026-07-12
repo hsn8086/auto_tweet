@@ -179,6 +179,92 @@ class GraphqlReplyParsingTests(unittest.TestCase):
         self.assertTrue(by_id["100"]["_pinned"])
         self.assertFalse(by_id["101"]["_pinned"])
 
+    def test_timeline_notification_joins_separate_author_and_target(self) -> None:
+        reply = _tweet(
+            "220",
+            author_id="20",
+            screen_name="verified",
+            created_at=self.now,
+            blue=True,
+            reply_to_tweet_id="100",
+            reply_to_user_id="10",
+        )
+        user_results = reply["core"]["user_results"]
+        source_user = user_results["result"]
+        source_user["core"] = {
+            "screen_name": source_user["legacy"].pop("screen_name"),
+            "name": source_user["legacy"].pop("name"),
+        }
+        reply["core"] = {
+            "user_results": {
+                "result": {
+                    "__typename": "UserUnavailable",
+                    "rest_id": "20",
+                }
+            }
+        }
+        payload = {
+            "data": {
+                "notification_timeline": {
+                    "instructions": [
+                        {
+                            "entries": [
+                                {
+                                    "content": {
+                                        "itemContent": {
+                                            "__typename": "TimelineNotification",
+                                            "template": {
+                                                "from_users": [
+                                                    {
+                                                        "__typename": "TimelineNotificationUserRef",
+                                                        "user": user_results,
+                                                    }
+                                                ],
+                                                "target_objects": [
+                                                    {
+                                                        "__typename": "TimelineNotificationTweetRef",
+                                                        "tweet": {
+                                                            "tweet_results": {
+                                                                "result": reply
+                                                            }
+                                                        },
+                                                    }
+                                                ],
+                                            },
+                                        }
+                                    }
+                                }
+                            ]
+                        }
+                    ]
+                }
+            }
+        }
+
+        tweets = parse_graphql_tweets(payload)
+
+        self.assertEqual([item["tweet_id"] for item in tweets], ["220"])
+        self.assertEqual(tweets[0]["author"]["user_id"], "20")
+        self.assertTrue(tweets[0]["author"]["is_verified"])
+
+    def test_profile_tweet_uses_known_author_fallback(self) -> None:
+        tweet = _tweet(
+            "221",
+            author_id="10",
+            screen_name="target",
+            created_at=self.now,
+        )
+        tweet.pop("core")
+
+        tweets = parse_graphql_tweets(
+            {"entries": [_entry(tweet)]},
+            fallback_author={"user_id": "10", "screen_name": "target"},
+        )
+
+        self.assertEqual([item["tweet_id"] for item in tweets], ["221"])
+        self.assertEqual(tweets[0]["author"]["user_id"], "10")
+        self.assertFalse(tweets[0]["author"]["is_verified"])
+
     def test_legacy_and_affiliate_verification_is_public(self) -> None:
         legacy = parse_graphql_tweets(
             {

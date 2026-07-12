@@ -3,6 +3,8 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Iterator
 from urllib.parse import unquote
 
+from loguru import logger
+
 from .model import State
 
 _TWID_RE = re.compile(r"u=(\d+)")
@@ -101,6 +103,91 @@ def _iter_tweet_candidates(
             yield from _iter_tweet_candidates(child, pinned=pinned)
 
 
+def _iter_dicts(value: Any) -> Iterator[dict[str, Any]]:
+    if isinstance(value, list):
+        for item in value:
+            yield from _iter_dicts(item)
+        return
+    if not isinstance(value, dict):
+        return
+    yield value
+    for child in value.values():
+        if isinstance(child, (dict, list)):
+            yield from _iter_dicts(child)
+
+
+def _notification_tweet_candidates(payload: Any) -> Iterator[dict[str, Any]]:
+    """Join TimelineNotification target tweets with their separate author objects."""
+    for container in _iter_dicts(payload):
+        template = container.get("template")
+        if not isinstance(template, dict):
+            continue
+        raw_users = template.get("from_users")
+        raw_targets = template.get("target_objects")
+        if not isinstance(raw_users, list) or not isinstance(raw_targets, list):
+            continue
+        users: dict[str, dict[str, Any]] = {}
+        for raw_user in raw_users:
+            if not isinstance(raw_user, dict):
+                continue
+            user_ref = raw_user.get("user", raw_user)
+            if not isinstance(user_ref, dict):
+                continue
+            user_results = user_ref.get("user_results", user_ref)
+            user = _unwrap_user(user_results)
+            user_id = _string_id(user.get("rest_id")) if user else None
+            if user_id:
+                users[user_id] = user_results
+
+        for target in raw_targets:
+            if not isinstance(target, dict):
+                continue
+            tweet_ref = target.get("tweet", target)
+            if not isinstance(tweet_ref, dict):
+                continue
+            tweet_results = tweet_ref.get("tweet_results", tweet_ref)
+            node = _unwrap_tweet_node(tweet_results)
+            if node is None:
+                continue
+            core = node.get("core")
+            embedded_id: str | None = None
+            if isinstance(core, dict):
+                embedded_user_results = core.get("user_results")
+                embedded_user = _unwrap_user(embedded_user_results)
+                embedded_legacy = (
+                    embedded_user.get("legacy")
+                    if isinstance(embedded_user, dict)
+                    else None
+                )
+                embedded_id = (
+                    _string_id(embedded_user.get("rest_id"))
+                    if isinstance(embedded_user, dict)
+                    else _wrapped_rest_id(embedded_user_results)
+                )
+                embedded_screen_name = (
+                    str(embedded_legacy.get("screen_name") or "").strip()
+                    if isinstance(embedded_legacy, dict)
+                    else ""
+                )
+                if embedded_id and embedded_screen_name:
+                    yield node
+                    continue
+            legacy = node.get("legacy")
+            author_id = embedded_id or (
+                _string_id(legacy.get("user_id_str") or legacy.get("user_id"))
+                if isinstance(legacy, dict)
+                else None
+            )
+            user_results = users.get(author_id or "")
+            if user_results is None and len(users) == 1:
+                user_results = next(iter(users.values()))
+            if user_results is None:
+                continue
+            joined = dict(node)
+            joined["core"] = {"user_results": user_results}
+            yield joined
+
+
 def _unwrap_user(candidate: Any) -> dict[str, Any] | None:
     node = candidate
     while isinstance(node, dict):
@@ -122,6 +209,21 @@ def _string_id(value: Any) -> str | None:
         return None
     result = str(value).strip()
     return result or None
+
+
+def _wrapped_rest_id(candidate: Any) -> str | None:
+    node = candidate
+    while isinstance(node, dict):
+        rest_id = _string_id(node.get("rest_id"))
+        if rest_id:
+            return rest_id
+        next_node = node.get("result")
+        if not isinstance(next_node, dict):
+            next_node = node.get("user")
+        if not isinstance(next_node, dict):
+            return None
+        node = next_node
+    return None
 
 
 def _media_dimensions(item: dict[str, Any]) -> tuple[int | None, int | None]:
@@ -206,7 +308,9 @@ def normalize_media(legacy: dict[str, Any]) -> list[dict[str, Any]]:
     return results
 
 
-def normalize_tweet(candidate: Any) -> dict[str, Any] | None:
+def normalize_tweet(
+    candidate: Any, *, fallback_author: dict[str, str] | None = None
+) -> dict[str, Any] | None:
     node = _unwrap_tweet_node(candidate)
     if node is None:
         return None
@@ -219,10 +323,25 @@ def normalize_tweet(candidate: Any) -> dict[str, Any] | None:
     user_results = core.get("user_results") if isinstance(core, dict) else None
     user = _unwrap_user(user_results)
     user_legacy = user.get("legacy") if isinstance(user, dict) else None
-    if not isinstance(user_legacy, dict):
+    user_core = user.get("core") if isinstance(user, dict) else None
+    if isinstance(user_legacy, dict):
+        user_id = _string_id(user.get("rest_id")) if isinstance(user, dict) else None
+        screen_name = (
+            str(
+                user_legacy.get("screen_name")
+                or (user_core.get("screen_name") if isinstance(user_core, dict) else "")
+                or ""
+            )
+            .strip()
+            .lstrip("@")
+        )
+    elif fallback_author is not None:
+        user = {}
+        user_legacy = {}
+        user_id = _string_id(fallback_author.get("user_id"))
+        screen_name = str(fallback_author.get("screen_name") or "").strip().lstrip("@")
+    else:
         return None
-    user_id = _string_id(user.get("rest_id")) if isinstance(user, dict) else None
-    screen_name = str(user_legacy.get("screen_name") or "").strip().lstrip("@")
     if user_id is None or not screen_name:
         return None
 
@@ -277,7 +396,11 @@ def normalize_tweet(candidate: Any) -> dict[str, Any] | None:
         "author": {
             "user_id": user_id,
             "screen_name": screen_name,
-            "name": str(user_legacy.get("name") or ""),
+            "name": str(
+                user_legacy.get("name")
+                or (user_core.get("name") if isinstance(user_core, dict) else "")
+                or ""
+            ),
             "is_blue_verified": is_blue_verified,
             "is_verified": is_verified,
             "verified_type": str(verified_type) if verified_type else None,
@@ -287,14 +410,16 @@ def normalize_tweet(candidate: Any) -> dict[str, Any] | None:
     }
 
 
-def parse_graphql_tweets(payload: Any) -> list[dict[str, Any]]:
+def parse_graphql_tweets(
+    payload: Any, *, fallback_author: dict[str, str] | None = None
+) -> list[dict[str, Any]]:
     """Extract normalized tweets from timeline instructions of any known shape."""
     if not isinstance(payload, dict):
         return []
     results: list[dict[str, Any]] = []
     seen: set[str] = set()
     for candidate, pinned in _iter_tweet_candidates(payload):
-        tweet = normalize_tweet(candidate)
+        tweet = normalize_tweet(candidate, fallback_author=fallback_author)
         if tweet is None:
             continue
         if tweet["tweet_id"] in seen:
@@ -305,6 +430,13 @@ def parse_graphql_tweets(payload: Any) -> list[dict[str, Any]]:
                         break
             continue
         tweet["_pinned"] = pinned
+        seen.add(tweet["tweet_id"])
+        results.append(tweet)
+    for candidate in _notification_tweet_candidates(payload):
+        tweet = normalize_tweet(candidate, fallback_author=fallback_author)
+        if tweet is None or tweet["tweet_id"] in seen:
+            continue
+        tweet["_pinned"] = False
         seen.add(tweet["tweet_id"])
         results.append(tweet)
     return results
@@ -367,30 +499,51 @@ def filter_verified_replies(
     parent_cutoff = now - timedelta(hours=parent_window_hours)
     by_id = {str(tweet["tweet_id"]): tweet for tweet in tweets}
     results: list[dict[str, Any]] = []
+    stats = {
+        "total": len(tweets),
+        "candidates": 0,
+        "verified": 0,
+        "direct": 0,
+        "after_since": 0,
+        "parent_refs": 0,
+        "parents_found": 0,
+        "parent_authors": 0,
+        "recent_parents": 0,
+        "accepted": 0,
+    }
     for tweet in tweets:
         if (
             candidate_reply_ids is not None
             and str(tweet.get("tweet_id")) not in candidate_reply_ids
         ):
             continue
+        stats["candidates"] += 1
         if not tweet.get("_is_verified"):
             continue
+        stats["verified"] += 1
         if tweet.get("in_reply_to_user_id") != expected_user_id:
             continue
+        stats["direct"] += 1
         if not _is_after_since(tweet, since_id=since_id, since_time=since_time):
             continue
+        stats["after_since"] += 1
         parent_id = tweet.get("in_reply_to_tweet_id")
+        if parent_id:
+            stats["parent_refs"] += 1
         parent = by_id.get(str(parent_id)) if parent_id else None
         if parent is None:
             continue
+        stats["parents_found"] += 1
         parent_author = parent.get("author")
         if not isinstance(parent_author, dict) or (
             parent_author.get("user_id") != expected_user_id
         ):
             continue
+        stats["parent_authors"] += 1
         parent_created_at = parse_datetime(str(parent.get("created_at") or ""))
         if parent_created_at is None or parent_created_at < parent_cutoff:
             continue
+        stats["recent_parents"] += 1
         public_reply = {
             key: value for key, value in tweet.items() if not key.startswith("_")
         }
@@ -399,6 +552,9 @@ def filter_verified_replies(
             for key in ("tweet_id", "text", "created_at", "url", "media")
         }
         results.append(public_reply)
+        stats["accepted"] += 1
+
+    logger.info("Verified reply filter stats: {}", stats)
 
     def sort_key(item: dict[str, Any]) -> tuple[datetime, int]:
         created = parse_datetime(str(item.get("created_at") or ""))

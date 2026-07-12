@@ -22,6 +22,10 @@ docker commit auto_tweet-auto-twi-1 auto_tweet-auto-twi:latest   # 固化镜像
 
 测试注意：本机 `.env` 里有 `proxy=`，断言不要写死 `proxy=None`（用 `ANY`）。
 
+代理按部署主机固定，构建参数与容器 `.env` 必须一致：sg 使用
+`http://192.168.14.3:7893`，qj 使用 `http://192.168.13.149:20172`。禁止跨主机
+借用代理；实测会造成 Playwright `ERR_CONNECTION_CLOSED` 和时间线空加载。
+
 ## 不可破坏的不变量
 
 1. **绝不重复发帖**：
