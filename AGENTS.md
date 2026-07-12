@@ -39,7 +39,8 @@ curl -fsS http://127.0.0.1:8000/api/v1/tweet/queue
 必须等待请求结束，并让上游通过 `GET /tweet/result/{request_id}` 完成对账；禁止
 强停浏览器或容器。还要在 qj 确认 `auto_send_history.status='leased'` 以及
 `x_reply_send_attempt.status in ('pending','sending')` 的数量均为 0，避免检查后的
-竞态。qj 的 `bot-auto-send-1` 有 5 分钟 watchdog，单独 `docker stop` 会被拉起。
+竞态。qj 的 `bot-auto-send-1` 有 5 分钟 watchdog，单独 `docker stop` 会被拉起；
+且 auto_send 每次进程启动会立即随机发送一次，禁止在维护中反复 stop/start。
 
 ## 不可破坏的不变量
 
