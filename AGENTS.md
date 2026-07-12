@@ -26,6 +26,21 @@ docker commit auto_tweet-auto-twi-1 auto_tweet-auto-twi:latest   # 固化镜像
 `http://192.168.14.3:7893`，qj 使用 `http://192.168.13.149:20172`。禁止跨主机
 借用代理；实测会造成 Playwright `ERR_CONNECTION_CLOSED` 和时间线空加载。
 
+## 重启前的队列闸门（必须执行）
+
+执行 `docker compose up`、`docker restart`、热更或替换容器前，先协调 qj 停止
+产生新的发帖/回复请求，再检查本机发送队列：
+
+```bash
+curl -fsS http://127.0.0.1:8000/api/v1/tweet/queue
+```
+
+只有返回 `{"waiting":0,"active":0}` 才能重启。`waiting` 或 `active` 任一非零时
+必须等待请求结束，并让上游通过 `GET /tweet/result/{request_id}` 完成对账；禁止
+强停浏览器或容器。还要在 qj 确认 `auto_send_history.status='leased'` 以及
+`x_reply_send_attempt.status in ('pending','sending')` 的数量均为 0，避免检查后的
+竞态。qj 的 `bot-auto-send-1` 有 5 分钟 watchdog，单独 `docker stop` 会被拉起。
+
 ## 不可破坏的不变量
 
 1. **绝不重复发帖**：
