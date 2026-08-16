@@ -12,6 +12,7 @@
 | POST | `/api/v1/tweet/post` | 发推。form/query: `state`(必填, Playwright storage_state JSON)、`context`、`spoiler`、`made_with_ai`、`request_id`(可选, `[A-Za-z0-9_.:-]{1,128}`)；files: `images`（最多 4 张） |
 | POST | `/api/v1/tweet/reply` | 回复。form: `state`、`expected_user_id`、`in_reply_to_tweet_id`、`request_id`（均必填），`context`（可空）；files: `images`（最多 4 张，允许纯图片） |
 | POST | `/api/v1/tweet/verified_replies` | 拉取认证账号的直接回复。form: `state`、`screen_name`、`expected_user_id`，可选 `since_id`、`since_time`、`parent_window_hours=48`、`max_scrolls=0`（0 表示不限滚动，1-60 表示有限上限） |
+| POST | `/api/v1/tweet/user_media` | 拉取目标账号原创图片推文。form: `state`、`screen_name`、`expected_user_id`、`expected_target_user_id`，可选 `since_id`、`since_time`、`max_scrolls=8`、`max_tweets=32`（硬上限 32） |
 | GET | `/api/v1/tweet/result/{request_id}` | 结果对账：返回 `{status, tweet_id?, warning?, error?, updated_at}`，status ∈ `running/success/sent_unconfirmed/failed`；未知 404 |
 | GET | `/api/v1/tweet/queue` | 当前排队/执行中的发送数 |
 | POST | `/api/v1/tweet/metrics` | 拉取推文数据（浏览/点赞/转发等）。form: `state`、`tweet_id` |
@@ -72,3 +73,12 @@ docker exec auto_tweet-auto-twi-1 sh -c 'cd /app && uv run python -m unittest di
   `{status, screen_name, viewer_user_id, newest_id, observed_newest_id, complete, replies}`。
   `newest_id`/`observed_newest_id` 是本轮看到的顶部通知 tweet id；上游只有在
   `complete=true` 时才能推进持久化游标，有限滚动耗尽时返回 `complete=false`。
+- `user_media` 返回
+  `{status, screen_name, viewer_user_id, target_user_id, newest_id, complete, tweets}`。
+  `target_user_id` 来自实际 UserTweets profile 响应，并必须等于
+  `expected_target_user_id`；缺失或不一致均失败，profile 身份核验前不会给缺少作者
+  的 tweet leaf 注入配置中的账号。只有扫描到 `since_id`/`since_time` 边界，或
+  GraphQL 明确返回时间线底部终止，且所有新图片推文都装得进 `max_tweets` 时，
+  `complete` 才为 `true`。达到滚动/响应上限、仅连续空转、或新图片超过 32 条时
+  均返回 `complete=false`，上游不得推进游标。当前协议没有分页 token；超过上限
+  的积压会持续 fail-closed，需人工处理后再恢复增量扫描。

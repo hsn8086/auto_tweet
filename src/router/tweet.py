@@ -23,6 +23,7 @@ from ..result_store import (
 from ..sender import (
     RETRYABLE_SEND_EXCEPTIONS,
     describe_send_exception,
+    fetch_user_media,
     fetch_verified_replies,
     send,
 )
@@ -32,6 +33,9 @@ SEND_TIMEOUT_SECONDS = 60 * 25
 # running 记录超过该时长视为陈旧（进程曾中途崩溃/重启），允许重试覆盖。
 STALE_RUNNING_SECONDS = SEND_TIMEOUT_SECONDS + 5 * 60
 VERIFIED_REPLIES_TIMEOUT_SECONDS = 60 * 45
+USER_MEDIA_TIMEOUT_SECONDS = 60 * 5
+# 上游按"发帖前拉一次"调用，必须有硬上限，避免一次翻页翻到几百条。
+USER_MEDIA_MAX_TWEETS = 32
 _SCREEN_NAME_RE = re.compile(r"^[A-Za-z0-9_]{1,15}$")
 
 
@@ -354,6 +358,121 @@ async def verified_replies(
         "observed_newest_id": result.get("observed_newest_id", result.get("newest_id")),
         "complete": bool(result.get("complete")),
         "replies": result.get("replies", []),
+    }
+
+
+@router.post("/user_media")
+async def user_media(
+    state_form: Annotated[str | None, Form(alias="state")] = None,
+    screen_name_form: Annotated[str | None, Form(alias="screen_name")] = None,
+    expected_user_id_form: Annotated[str | None, Form(alias="expected_user_id")] = None,
+    expected_target_user_id_form: Annotated[
+        str | None, Form(alias="expected_target_user_id")
+    ] = None,
+    since_id_form: Annotated[str | None, Form(alias="since_id")] = None,
+    since_time_form: Annotated[str | None, Form(alias="since_time")] = None,
+    max_scrolls_form: Annotated[int, Form(alias="max_scrolls")] = 8,
+    max_tweets_form: Annotated[int, Form(alias="max_tweets")] = USER_MEDIA_MAX_TWEETS,
+    api_key: Annotated[str | None, Header(alias="X-Auto-Tweet-Key")] = None,
+):
+    """列出某账号最近发过的图片（只返回 URL，不下载字节）。
+
+    上游用它维护"这张图对方已经发过"的感知索引，因此：
+      - 只返回该账号本人原创的照片，转推/引用的他人原图不算；
+      - since_id 之后的增量，且单次硬上限 32 条；
+      - 不带 request_id：只读操作，没有重复发送风险。
+    """
+    config = Config()
+    _require_api_key(config, api_key)
+    if (
+        state_form is None
+        or not screen_name_form
+        or not expected_user_id_form
+        or not expected_target_user_id_form
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "state、screen_name、expected_user_id 和 "
+                "expected_target_user_id 都是必填"
+            ),
+        )
+    screen_name = screen_name_form.strip().lstrip("@")
+    if not _SCREEN_NAME_RE.fullmatch(screen_name):
+        raise HTTPException(status_code=400, detail="无效的 screen_name")
+    expected_target_user_id = expected_target_user_id_form.strip()
+    if not expected_target_user_id.isdigit():
+        raise HTTPException(
+            status_code=400, detail="expected_target_user_id 必须为数字"
+        )
+    since_id = (since_id_form or "").strip() or None
+    if since_id is not None and not since_id.isdigit():
+        raise HTTPException(status_code=400, detail="since_id 必须为数字")
+    since_time = parse_datetime(since_time_form)
+    if since_time_form and since_time is None:
+        raise HTTPException(status_code=400, detail="since_time 必须为 ISO 时间")
+    if not 1 <= max_scrolls_form <= 20:
+        raise HTTPException(status_code=400, detail="max_scrolls 必须在 1 到 20 之间")
+    if not 1 <= max_tweets_form <= USER_MEDIA_MAX_TWEETS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"max_tweets 必须在 1 到 {USER_MEDIA_MAX_TWEETS} 之间",
+        )
+    state_pyd = _validate_state(state_form)
+    viewer_user_id = _validate_expected_user(state_pyd, expected_user_id_form)
+    try:
+        result = await asyncio.wait_for(
+            fetch_user_media(
+                screen_name,
+                expected_target_user_id,
+                state_pyd,
+                since_id=since_id,
+                since_time=since_time,
+                max_scrolls=max_scrolls_form,
+                max_tweets=max_tweets_form,
+                proxy=config.proxy,
+                headless=True,
+            ),
+            timeout=USER_MEDIA_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="收集账号图片超时")
+    except ValueError as exc:
+        # 时间线拿不到目标账号身份（句柄写错/被墙/登录弹回）——不能当成"没有新图"。
+        logger.warning("user_media identity check failed: {}", exc)
+        raise HTTPException(status_code=502, detail=str(exc))
+    except RETRYABLE_SEND_EXCEPTIONS as exc:
+        detail = describe_send_exception(exc)
+        logger.warning("Retriable error in user_media: {}", detail)
+        raise HTTPException(status_code=502, detail=detail)
+    except Exception as exc:
+        detail = describe_send_exception(exc)
+        logger.error("Unexpected error in user_media: {}", detail)
+        raise HTTPException(status_code=502, detail=detail)
+
+    tweets = result.get("tweets")
+    if not isinstance(tweets, list) or len(tweets) > max_tweets_form:
+        raise HTTPException(
+            status_code=502,
+            detail=f"@{screen_name} 返回的 tweets 无效或超过单次上限 {max_tweets_form}",
+        )
+    target_user_id = str(result.get("target_user_id") or "")
+    if target_user_id != expected_target_user_id:
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                f"@{screen_name} 返回的 target_user_id={target_user_id or '<empty>'} "
+                f"与期望 {expected_target_user_id} 不一致"
+            ),
+        )
+    return {
+        "status": "ok",
+        "screen_name": screen_name,
+        "viewer_user_id": viewer_user_id,
+        "target_user_id": target_user_id,
+        "newest_id": result.get("newest_id"),
+        "complete": result.get("complete") is True,
+        "tweets": tweets,
     }
 
 

@@ -1,7 +1,7 @@
 import re
 from datetime import datetime, timedelta, timezone
 from typing import Any, Iterator
-from urllib.parse import unquote
+from urllib.parse import parse_qsl, unquote, urlencode, urlsplit, urlunsplit
 
 from loguru import logger
 
@@ -309,7 +309,7 @@ def normalize_media(legacy: dict[str, Any]) -> list[dict[str, Any]]:
 
 
 def normalize_tweet(
-    candidate: Any, *, fallback_author: dict[str, str] | None = None
+    candidate: Any, *, fallback_author: dict[str, Any] | None = None
 ) -> dict[str, Any] | None:
     node = _unwrap_tweet_node(candidate)
     if node is None:
@@ -337,7 +337,10 @@ def normalize_tweet(
         )
     elif fallback_author is not None:
         user = {}
-        user_legacy = {}
+        user_legacy = {
+            "name": fallback_author.get("name"),
+            "followers_count": fallback_author.get("followers_count"),
+        }
         user_id = _string_id(fallback_author.get("user_id"))
         screen_name = str(fallback_author.get("screen_name") or "").strip().lstrip("@")
     else:
@@ -367,6 +370,9 @@ def normalize_tweet(
         or verified_type
         or (isinstance(affiliate, dict) and affiliate)
     )
+    followers_count = user_legacy.get("followers_count")
+    if not isinstance(followers_count, int) or isinstance(followers_count, bool):
+        followers_count = None
     created = parse_datetime(str(legacy.get("created_at") or ""))
     created_at = created.isoformat().replace("+00:00", "Z") if created else ""
     text = legacy.get("full_text") or legacy.get("text") or ""
@@ -404,14 +410,16 @@ def normalize_tweet(
             "is_blue_verified": is_blue_verified,
             "is_verified": is_verified,
             "verified_type": str(verified_type) if verified_type else None,
+            "followers_count": followers_count,
         },
         "media": normalize_media(legacy),
         "_is_verified": is_verified,
+        "_is_retweet": "retweeted_status_result" in legacy,
     }
 
 
 def parse_graphql_tweets(
-    payload: Any, *, fallback_author: dict[str, str] | None = None
+    payload: Any, *, fallback_author: dict[str, Any] | None = None
 ) -> list[dict[str, Any]]:
     """Extract normalized tweets from timeline instructions of any known shape."""
     if not isinstance(payload, dict):
@@ -483,6 +491,142 @@ def newest_tweet_id(tweets: list[dict[str, Any]]) -> str | None:
         return max(ids, key=int)
     except ValueError:
         return ids[0]
+
+
+def _original_photo_url(value: Any) -> str:
+    url = str(value or "").strip()
+    if not url:
+        return ""
+    parts = urlsplit(url)
+    hostname = (parts.hostname or "").lower()
+    if parts.scheme != "https" or not (
+        hostname == "pbs.twimg.com" or hostname.endswith(".twimg.com")
+    ):
+        return url
+    query = [(key, val) for key, val in parse_qsl(parts.query) if key != "name"]
+    query.append(("name", "orig"))
+    return urlunsplit(parts._replace(query=urlencode(query)))
+
+
+def filter_user_media_tweets(
+    tweets: list[dict[str, Any]],
+    *,
+    screen_name: str,
+    target_user_id: str | None = None,
+    since_id: str | None = None,
+    since_time: datetime | None = None,
+    max_tweets: int = 32,
+) -> dict[str, Any]:
+    """Return photo tweets authored by one verified target profile."""
+    name = screen_name.strip().lstrip("@")
+    verified_user_id = _string_id(target_user_id)
+    if target_user_id is not None and verified_user_id is None:
+        raise ValueError("target_user_id 必须有效")
+
+    matching: list[dict[str, Any]] = []
+    matching_user_ids: set[str] = set()
+    for tweet in tweets:
+        author = tweet.get("author")
+        if not isinstance(author, dict):
+            continue
+        author_name = str(author.get("screen_name") or "").strip().lstrip("@")
+        user_id = _string_id(author.get("user_id"))
+        if verified_user_id is not None:
+            if author_name.casefold() == name.casefold() and user_id not in (
+                None,
+                verified_user_id,
+            ):
+                raise ValueError(
+                    f"@{name} 的时间线推文作者 user_id={user_id} "
+                    f"与已验证身份 {verified_user_id} 不一致"
+                )
+            if user_id != verified_user_id:
+                continue
+        else:
+            if author_name.casefold() != name.casefold():
+                continue
+            if user_id is not None:
+                matching_user_ids.add(user_id)
+        matching.append(tweet)
+
+    if verified_user_id is None:
+        if not matching or not matching_user_ids:
+            raise ValueError(
+                f"无法从 @{name} 的时间线确认 target_user_id；"
+                "请确认账号存在且时间线可访问"
+            )
+        if len(matching_user_ids) != 1:
+            raise ValueError(
+                f"@{name} 的时间线返回了多个 target_user_id；拒绝返回可能混入的数据"
+            )
+        verified_user_id = next(iter(matching_user_ids))
+
+    results: list[dict[str, Any]] = []
+    for tweet in matching:
+        if tweet.get("_is_retweet") or not _is_after_since(
+            tweet, since_id=since_id, since_time=since_time
+        ):
+            continue
+        photos: list[dict[str, Any]] = []
+        media = tweet.get("media")
+        if isinstance(media, list):
+            for item in media:
+                if (
+                    not isinstance(item, dict)
+                    or str(item.get("type")).lower() != "photo"
+                ):
+                    continue
+                url = _original_photo_url(item.get("url"))
+                if not url:
+                    continue
+                photos.append(
+                    {
+                        "url": url,
+                        "preview_url": str(item.get("preview_url") or url),
+                        "width": item.get("width")
+                        if isinstance(item.get("width"), int)
+                        else None,
+                        "height": item.get("height")
+                        if isinstance(item.get("height"), int)
+                        else None,
+                    }
+                )
+        if not photos:
+            continue
+        author = tweet["author"]
+        results.append(
+            {
+                "tweet_id": str(tweet.get("tweet_id") or ""),
+                "text": str(tweet.get("text") or ""),
+                "created_at": str(tweet.get("created_at") or ""),
+                "url": str(tweet.get("url") or ""),
+                "author": {
+                    "user_id": str(author.get("user_id") or ""),
+                    "screen_name": str(author.get("screen_name") or ""),
+                    "followers_count": author.get("followers_count")
+                    if isinstance(author.get("followers_count"), int)
+                    else None,
+                },
+                "media": photos,
+            }
+        )
+
+    def sort_key(item: dict[str, Any]) -> tuple[datetime, int]:
+        created = parse_datetime(str(item.get("created_at") or ""))
+        try:
+            tweet_id = int(str(item.get("tweet_id") or "0"))
+        except ValueError:
+            tweet_id = 0
+        return created or datetime.min.replace(tzinfo=timezone.utc), tweet_id
+
+    ordered = sorted(results, key=sort_key, reverse=True)
+    limit = max(1, min(max_tweets, 32))
+    return {
+        "target_user_id": verified_user_id,
+        "newest_id": newest_tweet_id(matching),
+        "tweets": ordered[:limit],
+        "_truncated": len(ordered) > limit,
+    }
 
 
 def filter_verified_replies(

@@ -1,4 +1,5 @@
 import asyncio
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any
@@ -25,15 +26,18 @@ from tenacity import (
 
 from .model import PostSentError, State
 from .replies import (
+    filter_user_media_tweets,
     filter_verified_replies,
     newest_tweet_id,
+    normalize_media,
+    normalize_tweet,
     parse_datetime,
     parse_graphql_tweets,
     reached_since,
 )
 
 sem = asyncio.Semaphore(1)
-# 仅用于可观测性（/tweet/queue）：当前排队/执行中的发送数。
+# 仅用于可观测性（/tweet/queue）：当前排队/执行中的浏览器操作数。
 queue_stats = {"waiting": 0, "active": 0}
 RETRYABLE_SEND_EXCEPTIONS = (TimeoutError, ConnectionError, OSError, PlaywrightError)
 SCREENSHOT_TIMEOUT_SECONDS = 10
@@ -54,6 +58,22 @@ X_LOGIN_BOUNCE_MARKERS = (
     "redirect_after_login",
 )
 HOME_LOGIN_BOUNCE_RETRIES = 3
+
+
+@asynccontextmanager
+async def browser_queue_slot():
+    """Serialize and account for every browser operation."""
+    queue_stats["waiting"] += 1
+    try:
+        await sem.acquire()
+    finally:
+        queue_stats["waiting"] -= 1
+    queue_stats["active"] += 1
+    try:
+        yield
+    finally:
+        queue_stats["active"] -= 1
+        sem.release()
 
 
 def is_login_bounce_url(url: str) -> bool:
@@ -322,6 +342,149 @@ def parse_user_tweets_payload(payload: Any) -> list[dict[str, Any]]:
     return results
 
 
+def _user_media_result(payload: Any) -> dict[str, Any] | None:
+    if not isinstance(payload, dict):
+        return None
+    data = payload.get("data")
+    user = data.get("user") if isinstance(data, dict) else None
+    result = user.get("result") if isinstance(user, dict) else None
+    return result if isinstance(result, dict) else None
+
+
+def parse_user_media_profile(payload: Any) -> dict[str, Any] | None:
+    """Extract the fetched profile identity independently from tweet leaves."""
+    result = _user_media_result(payload)
+    if result is None:
+        return None
+    profile = result
+    if profile.get("__typename") == "UserWithVisibilityResults":
+        profile = profile.get("user")
+    if not isinstance(profile, dict):
+        return None
+    profile_id = profile.get("rest_id")
+    if isinstance(profile_id, bool) or not isinstance(profile_id, (str, int)):
+        return None
+    user_id = str(profile_id).strip()
+    if not user_id:
+        return None
+    legacy = profile.get("legacy")
+    legacy = legacy if isinstance(legacy, dict) else {}
+    return {
+        "user_id": user_id,
+        "screen_name": str(legacy.get("screen_name") or "").strip().lstrip("@"),
+        "name": str(legacy.get("name") or ""),
+        "followers_count": legacy.get("followers_count"),
+    }
+
+
+def parse_user_media_payload(
+    payload: Any, *, verified_author: dict[str, Any] | None = None
+) -> list[dict[str, Any]]:
+    """按 UserTweets 的已知 instruction 路径解析完整推文（含 author/media）。
+
+    profile 的当前 GraphQL payload 能被 `parse_user_tweets_payload` 稳定解析，但
+    `parse_graphql_tweets` 的全递归候选扫描在生产 payload 上返回空。媒体抓取不能
+    因为通用 parser 漏形状就把"没抓到"误判成"对方没发新图"，因此沿用已验证的
+    UserTweets 路径，只把叶子节点交给 replies.normalize_tweet。
+    """
+    result = _user_media_result(payload)
+    if result is None:
+        return []
+    instructions: list[Any] = []
+    timeline = result.get("timeline") or result.get("timeline_v2")
+    if isinstance(timeline, dict):
+        inner = timeline.get("timeline")
+        if isinstance(inner, dict):
+            found = inner.get("instructions")
+            if isinstance(found, list):
+                instructions = found
+
+    results: list[dict[str, Any]] = []
+    seen: set[str] = set()
+
+    def collect_entry(entry: Any, *, pinned: bool) -> None:
+        if not isinstance(entry, dict):
+            return
+        content = entry.get("content")
+        if not isinstance(content, dict):
+            return
+        item_content = content.get("itemContent")
+        if not isinstance(item_content, dict):
+            return
+        tweet_results = item_content.get("tweet_results")
+        if not isinstance(tweet_results, dict):
+            return
+        tweet = normalize_tweet(
+            tweet_results.get("result"), fallback_author=verified_author
+        )
+        if tweet is None and verified_author is not None:
+            # 当前 profile UserTweets 的 leaf 能被指标 parser 解包，但不满足回复
+            # parser 对 core.user_results 的完整形状要求。这里沿用指标 parser 已验证
+            # 的 `_unwrap_tweet_node`，作者只能由已验证的 profile 身份提供。
+            node = _unwrap_tweet_node(tweet_results.get("result"))
+            legacy = node.get("legacy") if isinstance(node, dict) else None
+            tweet_id = node.get("rest_id") if isinstance(node, dict) else None
+            if isinstance(legacy, dict) and isinstance(tweet_id, (str, int)):
+                created = parse_tweet_created_at(str(legacy.get("created_at") or ""))
+                screen_name = str(verified_author.get("screen_name") or "")
+                tweet = {
+                    "tweet_id": str(tweet_id),
+                    "text": str(legacy.get("full_text") or legacy.get("text") or ""),
+                    "created_at": (
+                        created.isoformat().replace("+00:00", "Z") if created else ""
+                    ),
+                    "url": f"https://x.com/{screen_name}/status/{tweet_id}",
+                    "author": {
+                        "user_id": str(verified_author.get("user_id") or ""),
+                        "screen_name": screen_name,
+                        "name": str(verified_author.get("name") or ""),
+                        "followers_count": verified_author.get("followers_count"),
+                    },
+                    "media": normalize_media(legacy),
+                    "_is_retweet": "retweeted_status_result" in legacy,
+                }
+        if tweet is None:
+            return
+        tweet_id = str(tweet.get("tweet_id") or "")
+        if not tweet_id or tweet_id in seen:
+            return
+        tweet["_pinned"] = pinned
+        seen.add(tweet_id)
+        results.append(tweet)
+
+    for instruction in instructions:
+        if not isinstance(instruction, dict):
+            continue
+        kind = instruction.get("type")
+        if kind == "TimelinePinEntry":
+            collect_entry(instruction.get("entry"), pinned=True)
+            continue
+        entries = instruction.get("entries")
+        if not isinstance(entries, list):
+            continue
+        for entry in entries:
+            collect_entry(entry, pinned=False)
+    return results
+
+
+def user_media_timeline_exhausted(payload: Any) -> bool:
+    """Return true only for an explicit bottom-of-timeline termination."""
+    result = _user_media_result(payload)
+    if result is None:
+        return False
+    timeline = result.get("timeline") or result.get("timeline_v2")
+    inner = timeline.get("timeline") if isinstance(timeline, dict) else None
+    instructions = inner.get("instructions") if isinstance(inner, dict) else None
+    if not isinstance(instructions, list):
+        return False
+    return any(
+        isinstance(instruction, dict)
+        and instruction.get("type") == "TimelineTerminateTimeline"
+        and str(instruction.get("direction") or "").casefold() == "bottom"
+        for instruction in instructions
+    )
+
+
 USER_TWEETS_HYDRATION_WAIT_MS = 6_000
 USER_TWEETS_SCROLL_INTERVAL_MS = 7_000
 # X 分页由"滚到底部 sentinel"触发且 GraphQL 响应可能 ~10s 才回，容忍多轮空转
@@ -364,6 +527,7 @@ async def _collect_replies_timeline(
     oldest_time: datetime | None = None,
     boundary_reply_to_user_id: str | None = None,
     boundary_author_user_id: str | None = None,
+    boundary_author_screen_name: str | None = None,
     fallback_author: dict[str, str] | None = None,
 ) -> TimelineCollection:
     page = await context.new_page()
@@ -401,12 +565,31 @@ async def _collect_replies_timeline(
     def collect_payload(payload: Any) -> bool:
         nonlocal reached_boundary
         got_new = False
-        parsed = parse_graphql_tweets(payload, fallback_author=fallback_author)
+        parsed = (
+            parse_user_media_payload(payload)
+            if boundary_author_screen_name is not None
+            else parse_graphql_tweets(payload, fallback_author=fallback_author)
+        )
+        if boundary_author_screen_name is not None:
+            logger.info(
+                "User media payload parsed {} tweets for @{}",
+                len(parsed),
+                boundary_author_screen_name,
+            )
         since_candidates = parsed
+        if boundary_author_screen_name is not None:
+            boundary_name = boundary_author_screen_name.casefold()
+            since_candidates = [
+                item
+                for item in since_candidates
+                if str(item.get("author", {}).get("screen_name") or "").casefold()
+                == boundary_name
+                and not item.get("_pinned")
+            ]
         if boundary_reply_to_user_id is not None:
             since_candidates = [
                 item
-                for item in parsed
+                for item in since_candidates
                 if item.get("in_reply_to_user_id") == boundary_reply_to_user_id
             ]
         if reached_since(since_candidates, since_id=since_id, since_time=since_time):
@@ -542,7 +725,7 @@ async def fetch_verified_replies(
     """Collect verified direct replies and hydrate their parent tweets."""
     name = screen_name.strip().lstrip("@")
     parent_cutoff = datetime.now(timezone.utc) - timedelta(hours=parent_window_hours)
-    async with sem:
+    async with browser_queue_slot():
         async with async_playwright() as p:
             browser = await p.chromium.launch(
                 channel="msedge",
@@ -632,6 +815,208 @@ async def fetch_verified_replies(
                     )
 
 
+async def fetch_user_media(
+    screen_name: str,
+    expected_target_user_id: str,
+    state: State,
+    *,
+    since_id: str | None = None,
+    since_time: datetime | None = None,
+    max_scrolls: int = 8,
+    max_tweets: int = 32,
+    proxy: str | None = None,
+    headless: bool = True,
+) -> dict[str, Any]:
+    """Collect recent photo tweets from one profile without downloading media."""
+    name = screen_name.strip().lstrip("@")
+    if not name or not expected_target_user_id.isdigit():
+        raise ValueError("screen_name 和 expected_target_user_id 必须有效")
+    if not 1 <= max_tweets <= 32:
+        raise ValueError("max_tweets 必须在 1 到 32 之间")
+    async with browser_queue_slot():
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(
+                channel="msedge",
+                proxy=ProxySettings(server=proxy) if proxy else None,
+                headless=headless,
+                executable_path="/usr/bin/chromium",
+                args=[
+                    "--disable-gpu",
+                    "--no-sandbox",
+                    "--enable-unsafe-swiftshader",
+                ],
+            )
+            try:
+                context = await browser.new_context(
+                    storage_state=StorageState(**state.model_dump()), locale="zh-CN"
+                )
+                page = await context.new_page()
+                page.on("console", log_console_message)
+                payloads: asyncio.Queue[Any] = asyncio.Queue()
+                matched_responses = 0
+                response_tasks: set[asyncio.Task[None]] = set()
+
+                async def read_response(response: "Response") -> None:
+                    try:
+                        payloads.put_nowait(await response.json())
+                    except Exception as exc:
+                        logger.warning(
+                            "Failed to read UserTweets media response: {}",
+                            describe_send_exception(exc),
+                        )
+
+                def on_response(response: "Response") -> None:
+                    nonlocal matched_responses
+                    if not is_user_tweets_response(response):
+                        return
+                    matched_responses += 1
+                    task = asyncio.create_task(read_response(response))
+                    response_tasks.add(task)
+                    task.add_done_callback(response_tasks.discard)
+
+                page.on("response", on_response)
+                await page.goto(
+                    f"https://x.com/{name}",
+                    wait_until="domcontentloaded",
+                    timeout=90_000,
+                )
+                await page.wait_for_timeout(USER_TWEETS_HYDRATION_WAIT_MS)
+
+                collected: dict[str, dict[str, Any]] = {}
+                idle_rounds = 0
+                reached_boundary = False
+                timeline_exhausted = False
+                verified_profile: dict[str, Any] | None = None
+                pending_payloads: list[Any] = []
+
+                def drain_payloads() -> bool:
+                    nonlocal reached_boundary, timeline_exhausted, verified_profile
+                    got_new = False
+                    while True:
+                        try:
+                            payload = payloads.get_nowait()
+                        except asyncio.QueueEmpty:
+                            break
+                        fetched_profile = parse_user_media_profile(payload)
+                        if fetched_profile is not None:
+                            fetched_user_id = str(fetched_profile.get("user_id") or "")
+                            if fetched_user_id != expected_target_user_id:
+                                raise ValueError(
+                                    f"@{name} profile 返回的 target_user_id="
+                                    f"{fetched_user_id or '<empty>'} 与期望 "
+                                    f"{expected_target_user_id} 不一致"
+                                )
+                            fetched_profile["screen_name"] = str(
+                                fetched_profile.get("screen_name") or name
+                            )
+                            if verified_profile is None:
+                                verified_profile = fetched_profile
+                            else:
+                                verified_profile.update(
+                                    {
+                                        key: value
+                                        for key, value in fetched_profile.items()
+                                        if value not in (None, "")
+                                    }
+                                )
+
+                        if verified_profile is None:
+                            pending_payloads.append(payload)
+                            continue
+
+                        pages = [*pending_payloads, payload]
+                        pending_payloads.clear()
+                        for page_payload in pages:
+                            timeline_exhausted = (
+                                user_media_timeline_exhausted(page_payload)
+                                or timeline_exhausted
+                            )
+                            parsed = parse_user_media_payload(
+                                page_payload, verified_author=verified_profile
+                            )
+                            coverage_tweets = [
+                                item
+                                for item in parsed
+                                if not item.get("_pinned")
+                                and str(item.get("author", {}).get("user_id") or "")
+                                == expected_target_user_id
+                            ]
+                            if reached_since(
+                                coverage_tweets,
+                                since_id=since_id,
+                                since_time=since_time,
+                            ):
+                                reached_boundary = True
+                            for item in parsed:
+                                tweet_id = str(item.get("tweet_id") or "")
+                                if tweet_id and tweet_id not in collected:
+                                    collected[tweet_id] = item
+                                    got_new = True
+                    return got_new
+
+                for _ in range(max_scrolls):
+                    got_new = drain_payloads()
+                    if reached_boundary or timeline_exhausted:
+                        break
+                    idle_rounds = 0 if got_new else idle_rounds + 1
+                    # 与 user_metrics 一致：首条没抓到前不能因为空轮次提前退出。
+                    if idle_rounds >= USER_TWEETS_IDLE_ROUNDS and collected:
+                        break
+                    await page.evaluate(
+                        "window.scrollTo(0, document.documentElement.scrollHeight)"
+                    )
+                    await page.wait_for_timeout(USER_TWEETS_SCROLL_INTERVAL_MS)
+                if response_tasks:
+                    await asyncio.gather(*tuple(response_tasks), return_exceptions=True)
+                drain_payloads()
+                await page.close()
+
+                if matched_responses == 0:
+                    raise RuntimeError(
+                        f"未捕获 @{name} 的个人时间线响应；请确认账号存在且登录 state 可访问该主页"
+                    )
+                if verified_profile is None:
+                    raise ValueError(
+                        f"无法从 @{name} 的 profile 响应确认 target_user_id；"
+                        "拒绝使用配置值代替实际抓取身份"
+                    )
+                verified_target_user_id = str(verified_profile["user_id"])
+                result = filter_user_media_tweets(
+                    list(collected.values()),
+                    screen_name=name,
+                    target_user_id=verified_target_user_id,
+                    since_id=since_id,
+                    since_time=since_time,
+                    max_tweets=max_tweets,
+                )
+                truncated = bool(result.pop("_truncated", False))
+                complete = (reached_boundary or timeline_exhausted) and not truncated
+                result["complete"] = complete
+                logger.info(
+                    "User media collect for @{} user_id={}: {} photo tweets "
+                    "(responses={} boundary={} exhausted={} truncated={} complete={})",
+                    name,
+                    result["target_user_id"],
+                    len(result["tweets"]),
+                    matched_responses,
+                    reached_boundary,
+                    timeline_exhausted,
+                    truncated,
+                    complete,
+                )
+                return result
+            finally:
+                try:
+                    await asyncio.wait_for(
+                        browser.close(), timeout=BROWSER_CLOSE_TIMEOUT_SECONDS
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to close browser cleanly: {}",
+                        describe_send_exception(exc),
+                    )
+
+
 async def fetch_user_tweets_metrics(
     screen_name: str,
     state: State,
@@ -655,7 +1040,7 @@ async def fetch_user_tweets_metrics(
     cutoff = datetime.now(timezone.utc) - timedelta(hours=until_hours)
     collected: dict[str, dict[str, Any]] = {}
     reached_cutoff = False
-    async with sem:
+    async with browser_queue_slot():
         async with async_playwright() as p:
             browser = await p.chromium.launch(
                 channel="msedge",
@@ -753,7 +1138,7 @@ async def fetch_tweet_metrics(
     if not rest_id:
         raise ValueError("tweet_id is required")
     url = f"https://x.com/i/web/status/{rest_id}"
-    async with sem:
+    async with browser_queue_slot():
         async with async_playwright() as p:
             browser = await p.chromium.launch(
                 channel="msedge",
@@ -1118,13 +1503,7 @@ async def send(
     tweet_id: str | None = None
     create_tweet_dispatched = False
 
-    queue_stats["waiting"] += 1
-    try:
-        await sem.acquire()
-    finally:
-        queue_stats["waiting"] -= 1
-    queue_stats["active"] += 1
-    try:
+    async with browser_queue_slot():
         async with async_playwright() as p:
             logger.info("Launching browser...")
             browser = await p.chromium.launch(
@@ -1301,7 +1680,4 @@ async def send(
                         "Failed to close browser cleanly: {}",
                         describe_send_exception(e),
                     )
-    finally:
-        queue_stats["active"] -= 1
-        sem.release()
     return tweet_id
