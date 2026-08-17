@@ -33,6 +33,17 @@ class FakeLocator:
 
 
 class SenderHelperTests(unittest.IsolatedAsyncioTestCase):
+    async def test_settle_response_tasks_does_not_depend_on_done_callback(
+        self,
+    ) -> None:
+        task = asyncio.create_task(asyncio.sleep(0))
+        tasks = {task}
+
+        await asyncio.wait_for(sender._settle_response_tasks(tasks), timeout=0.1)
+
+        self.assertTrue(task.done())
+        self.assertEqual(tasks, set())
+
     def test_reply_timeline_response_supports_profile_v2_operation(self) -> None:
         response = type(
             "Response",
@@ -301,6 +312,75 @@ class SenderHelperTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.response_errors, 2)
         self.assertFalse(result.complete)
         self.assertEqual([item["tweet_id"] for item in result.tweets], ["901"])
+
+    async def test_timeline_captures_response_emitted_during_close(self) -> None:
+        late_json_calls = 0
+
+        class InitialResponse:
+            url = "https://x.com/i/api/graphql/id/NotificationsTimeline"
+            request = type("Request", (), {"method": "GET"})()
+            status = 200
+
+            async def json(self) -> dict[str, Any]:
+                return {"data": {}}
+
+        class LateResponse(InitialResponse):
+            async def json(self) -> dict[str, Any]:
+                nonlocal late_json_calls
+                late_json_calls += 1
+                return {"errors": [{"code": 1}]}
+
+        class Page:
+            def __init__(self) -> None:
+                self.response_handler = None
+
+            def on(self, event: str, handler) -> None:
+                if event == "response":
+                    self.response_handler = handler
+
+            async def goto(self, *_args, **_kwargs) -> None:
+                assert self.response_handler is not None
+                await self.response_handler(InitialResponse())
+
+            async def wait_for_timeout(self, _timeout: int) -> None:
+                pass
+
+            async def evaluate(self, _script: str) -> None:
+                pass
+
+            async def close(self) -> None:
+                assert self.response_handler is not None
+                late_task = self.response_handler(LateResponse())
+                if late_task is not None:
+                    await late_task
+
+        class Context:
+            def __init__(self, page: Page) -> None:
+                self.page = page
+
+            async def new_page(self) -> Page:
+                return self.page
+
+        parsed = [
+            {
+                "tweet_id": "100",
+                "created_at": "2026-08-17T00:00:00+00:00",
+                "in_reply_to_user_id": "10",
+                "author": {"user_id": "20"},
+            }
+        ]
+        with patch("src.sender.parse_graphql_tweets", return_value=parsed):
+            result = await sender._collect_replies_timeline(
+                cast(Any, Context(Page())),
+                "https://x.com/notifications/verified",
+                max_scrolls=1,
+                since_id="100",
+                boundary_reply_to_user_id="10",
+            )
+
+        self.assertFalse(result.complete)
+        self.assertEqual(result.response_errors, 1)
+        self.assertEqual(late_json_calls, 1)
 
     async def test_wait_e_returns_messageful_timeout(self) -> None:
         blocked = FakeLocator(enabled=False)

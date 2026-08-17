@@ -551,6 +551,16 @@ class TimelineCollection:
     response_errors: int = 0
 
 
+async def _settle_response_tasks(tasks: set[asyncio.Task[Any]]) -> None:
+    """Await and remove the current task batch without relying on callbacks."""
+    while tasks:
+        current_tasks = tuple(tasks)
+        await asyncio.gather(*current_tasks, return_exceptions=True)
+        # Python 3.12 may not have run add_done_callback yet. Explicit removal
+        # avoids spinning on an already-completed gather without yielding.
+        tasks.difference_update(current_tasks)
+
+
 def is_replies_timeline_response(response: "Response") -> bool:
     if not any(
         operation in response.url
@@ -588,6 +598,7 @@ async def _collect_replies_timeline(
     matched_responses = 0
     response_errors = 0
     response_tasks: set[asyncio.Task[None]] = set()
+    accepting_responses = True
 
     async def _read_response(response: "Response") -> None:
         nonlocal matched_responses, response_errors
@@ -618,6 +629,8 @@ async def _collect_replies_timeline(
             )
 
     def _on_response(response: "Response") -> asyncio.Task[None] | None:
+        if not accepting_responses:
+            return None
         if not is_replies_timeline_response(response):
             return None
         task = asyncio.create_task(_read_response(response))
@@ -625,17 +638,12 @@ async def _collect_replies_timeline(
         task.add_done_callback(response_tasks.discard)
         return task
 
-    async def settle_response_tasks() -> None:
-        # 与 fetch_user_media 同款：判定 complete 前必须把在途响应读完，
-        # 否则刚回来的那一页会被漏掉，却仍被当成"已到边界/空转结束"。
-        while response_tasks:
-            await asyncio.gather(*tuple(response_tasks), return_exceptions=True)
-
     page.on("response", _on_response)
     collected: dict[str, dict[str, Any]] = {}
     idle_rounds = 0
     reached_boundary = False
     complete = False
+    page_close_started = False
 
     def collect_payload(payload: Any) -> bool:
         nonlocal reached_boundary
@@ -686,7 +694,7 @@ async def _collect_replies_timeline(
         )
         scrolls = 0
         while True:
-            await settle_response_tasks()
+            await _settle_response_tasks(response_tasks)
             got_new = False
             while True:
                 try:
@@ -707,7 +715,10 @@ async def _collect_replies_timeline(
             )
             scrolls += 1
             await page.wait_for_timeout(USER_TWEETS_SCROLL_INTERVAL_MS)
-        await settle_response_tasks()
+        page_close_started = True
+        await page.close()
+        accepting_responses = False
+        await _settle_response_tasks(response_tasks)
         while True:
             try:
                 payload = payloads.get_nowait()
@@ -723,12 +734,14 @@ async def _collect_replies_timeline(
             response_errors=response_errors,
         )
     finally:
+        accepting_responses = False
         if response_tasks:
             pending_tasks = tuple(response_tasks)
             for task in pending_tasks:
                 task.cancel()
             await asyncio.gather(*pending_tasks, return_exceptions=True)
-        await page.close()
+        if not page_close_started:
+            await page.close()
 
 
 async def _collect_replies_timeline_with_retry(
@@ -917,6 +930,7 @@ async def fetch_user_media(
                 matched_responses = 0
                 response_errors = 0
                 response_tasks: set[asyncio.Task[None]] = set()
+                accepting_responses = True
 
                 async def read_response(response: "Response") -> None:
                     nonlocal matched_responses, response_errors
@@ -943,18 +957,13 @@ async def fetch_user_media(
                         )
 
                 def on_response(response: "Response") -> None:
+                    if not accepting_responses:
+                        return
                     if not is_user_tweets_response(response):
                         return
                     task = asyncio.create_task(read_response(response))
                     response_tasks.add(task)
                     task.add_done_callback(response_tasks.discard)
-
-                async def settle_response_tasks() -> None:
-                    # 完成度判断前必须把在途响应读完，否则会漏掉刚回来的那一页。
-                    while response_tasks:
-                        await asyncio.gather(
-                            *tuple(response_tasks), return_exceptions=True
-                        )
 
                 page.on("response", on_response)
                 await page.goto(
@@ -1038,7 +1047,7 @@ async def fetch_user_media(
 
                 try:
                     for _ in range(max_scrolls):
-                        await settle_response_tasks()
+                        await _settle_response_tasks(response_tasks)
                         got_new = drain_payloads()
                         if reached_boundary or timeline_exhausted:
                             break
@@ -1050,16 +1059,19 @@ async def fetch_user_media(
                             "window.scrollTo(0, document.documentElement.scrollHeight)"
                         )
                         await page.wait_for_timeout(USER_TWEETS_SCROLL_INTERVAL_MS)
-                    await settle_response_tasks()
+                    await _settle_response_tasks(response_tasks)
+                    drain_payloads()
+                    await page.close()
+                    accepting_responses = False
+                    await _settle_response_tasks(response_tasks)
                     drain_payloads()
                 finally:
+                    accepting_responses = False
                     if response_tasks:
                         pending_tasks = tuple(response_tasks)
                         for task in pending_tasks:
                             task.cancel()
                         await asyncio.gather(*pending_tasks, return_exceptions=True)
-                await page.close()
-
                 if matched_responses == 0:
                     raise RuntimeError(
                         f"未捕获 @{name} 的个人时间线响应；请确认账号存在且登录 state 可访问该主页"

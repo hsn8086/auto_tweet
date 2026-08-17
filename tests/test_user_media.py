@@ -178,8 +178,13 @@ class _SlowUserMediaResponse(_UserMediaResponse):
 
 
 class _UserMediaPage:
-    def __init__(self, payload_batches: list[list[Any]]) -> None:
+    def __init__(
+        self,
+        payload_batches: list[list[Any]],
+        close_responses: list[Any] | None = None,
+    ) -> None:
         self.payload_batches = list(payload_batches)
+        self.close_responses = list(close_responses or [])
         self.response_handler = None
         self.scrolls = 0
         self.closed = False
@@ -206,13 +211,20 @@ class _UserMediaPage:
         self.scrolls += 1
 
     async def close(self) -> None:
+        assert self.response_handler is not None
+        for response in self.close_responses:
+            self.response_handler(response)
+        await asyncio.sleep(0)
         self.closed = True
 
 
 async def _fetch_with_payloads(
-    payload_batches: list[list[dict[str, Any]]], **kwargs: Any
+    payload_batches: list[list[dict[str, Any]]],
+    *,
+    close_responses: list[Any] | None = None,
+    **kwargs: Any,
 ) -> tuple[dict[str, Any], _UserMediaPage]:
-    page = _UserMediaPage(payload_batches)
+    page = _UserMediaPage(payload_batches, close_responses)
     context = SimpleNamespace(new_page=AsyncMock(return_value=page))
     browser = SimpleNamespace(
         new_context=AsyncMock(return_value=context), close=AsyncMock()
@@ -730,6 +742,20 @@ class FetchUserMediaSafetyTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["complete"])
         # 响应在首轮就被结算，不必再滚动等待
         self.assertEqual(page.scrolls, 0)
+
+    async def test_response_emitted_during_page_close_forces_incomplete(self) -> None:
+        payload = _payload([], profile_id="1", exhausted=True)
+        late = _UserMediaResponse({"errors": [{"message": "late response"}]})
+        late.json = AsyncMock(return_value=late.payload)
+
+        result, _ = await _fetch_with_payloads(
+            [[payload]],
+            since_id="100",
+            close_responses=[late],
+        )
+
+        self.assertFalse(result["complete"])
+        late.json.assert_awaited_once()
 
 
 class BrowserQueueSlotTests(unittest.TestCase):
