@@ -13,11 +13,13 @@ from src.model import State
 from src.replies import filter_user_media_tweets, parse_graphql_tweets
 from src.router.tweet import router
 from src.sender import (
+    _is_clean_user_media_response,
     browser_queue_slot,
     fetch_user_media,
     parse_user_media_payload,
     parse_user_media_profile,
     queue_stats,
+    user_media_timeline_exhausted,
 )
 
 NOW = datetime(2026, 8, 1, 12, tzinfo=timezone.utc)
@@ -52,6 +54,7 @@ def _tweet(
     media: list[dict] | None = None,
     retweet_of: dict | None = None,
     quote_of: dict | None = None,
+    modern_user: bool = False,
 ) -> dict:
     legacy = {
         "full_text": f"tweet {tweet_id}",
@@ -64,23 +67,25 @@ def _tweet(
         legacy["retweeted_status_result"] = {"result": retweet_of}
     if quote_of is not None:
         legacy["quoted_status_result"] = {"result": quote_of}
+    author: dict[str, Any] = {
+        "rest_id": author_id,
+        "is_blue_verified": False,
+        "legacy": {
+            "screen_name": screen_name,
+            "name": screen_name.title(),
+            "followers_count": 100000,
+        },
+    }
+    if modern_user:
+        # X 现代 user 对象：没有 legacy，用户名在 core，粉丝数在 relationship_counts
+        author.pop("legacy")
+        author["core"] = {"screen_name": screen_name, "name": screen_name.title()}
+        author["relationship_counts"] = {"followers": 100000}
     return {
         "__typename": "Tweet",
         "rest_id": tweet_id,
         "legacy": legacy,
-        "core": {
-            "user_results": {
-                "result": {
-                    "rest_id": author_id,
-                    "is_blue_verified": False,
-                    "legacy": {
-                        "screen_name": screen_name,
-                        "name": screen_name.title(),
-                        "followers_count": 100000,
-                    },
-                }
-            }
-        },
+        "core": {"user_results": {"result": author}},
     }
 
 
@@ -90,6 +95,8 @@ def _payload(
     profile_id: str | None = None,
     profile_screen_name: str = "yunjiu",
     exhausted: bool = False,
+    profile_modern: bool = False,
+    visibility_wrapped: bool = False,
 ) -> dict:
     instructions = [
         {
@@ -112,16 +119,24 @@ def _payload(
         )
     profile: dict[str, Any] = {"timeline": {"timeline": {"instructions": instructions}}}
     if profile_id is not None:
-        profile.update(
-            {
-                "rest_id": profile_id,
-                "legacy": {
-                    "screen_name": profile_screen_name,
-                    "name": profile_screen_name.title(),
-                    "followers_count": 100000,
-                },
+        profile["rest_id"] = profile_id
+        if profile_modern:
+            profile["core"] = {
+                "screen_name": profile_screen_name,
+                "name": profile_screen_name.title(),
             }
-        )
+            profile["relationship_counts"] = {"followers": 100000}
+        else:
+            profile["legacy"] = {
+                "screen_name": profile_screen_name,
+                "name": profile_screen_name.title(),
+                "followers_count": 100000,
+            }
+    if visibility_wrapped:
+        profile = {
+            "__typename": "UserWithVisibilityResults",
+            "user": {"__typename": "User", **profile},
+        }
     return {"data": {"user": {"result": profile}}}
 
 
@@ -130,18 +145,40 @@ def _parse(nodes: list[dict]) -> list[dict]:
 
 
 class _UserMediaResponse:
-    url = "https://x.com/i/api/graphql/hash/UserTweets?variables=x"
     request = SimpleNamespace(method="GET")
 
-    def __init__(self, payload: dict[str, Any]) -> None:
+    def __init__(
+        self,
+        payload: dict[str, Any],
+        *,
+        status: int = 200,
+        url: str = "https://x.com/i/api/graphql/hash/UserTweets?variables=x",
+    ) -> None:
         self.payload = payload
+        self.status = status
+        self.url = url
 
     async def json(self) -> dict[str, Any]:
         return self.payload
 
 
+class _SlowUserMediaResponse(_UserMediaResponse):
+    """Response whose body only resolves after a few event-loop turns."""
+
+    def __init__(
+        self, payload: dict[str, Any], *, turns: int = 3, **kwargs: Any
+    ) -> None:
+        super().__init__(payload, **kwargs)
+        self.turns = turns
+
+    async def json(self) -> dict[str, Any]:
+        for _ in range(self.turns):
+            await asyncio.sleep(0)
+        return self.payload
+
+
 class _UserMediaPage:
-    def __init__(self, payload_batches: list[list[dict[str, Any]]]) -> None:
+    def __init__(self, payload_batches: list[list[Any]]) -> None:
         self.payload_batches = list(payload_batches)
         self.response_handler = None
         self.scrolls = 0
@@ -158,7 +195,11 @@ class _UserMediaPage:
         if self.payload_batches:
             assert self.response_handler is not None
             for payload in self.payload_batches.pop(0):
-                self.response_handler(_UserMediaResponse(payload))
+                self.response_handler(
+                    payload
+                    if isinstance(payload, _UserMediaResponse)
+                    else _UserMediaResponse(payload)
+                )
         await asyncio.sleep(0)
 
     async def evaluate(self, _script: str) -> None:
@@ -242,6 +283,108 @@ class FilterUserMediaTests(unittest.TestCase):
         self.assertEqual(tweets[0]["author"]["user_id"], "1613079089879076864")
         self.assertEqual(tweets[0]["author"]["screen_name"], "YunJiu")
         self.assertEqual(tweets[0]["author"]["followers_count"], 106500)
+
+    def test_modern_user_without_legacy_keeps_identity_and_followers(self) -> None:
+        payload = _payload(
+            [
+                _tweet(
+                    "249",
+                    author_id="1613079089879076864",
+                    screen_name="YunJiu",
+                    media=[_photo("https://pbs.twimg.com/media/modern.jpg")],
+                    modern_user=True,
+                )
+            ]
+        )
+
+        tweets = parse_user_media_payload(payload)
+
+        self.assertEqual([tweet["tweet_id"] for tweet in tweets], ["249"])
+        self.assertEqual(tweets[0]["author"]["user_id"], "1613079089879076864")
+        self.assertEqual(tweets[0]["author"]["screen_name"], "YunJiu")
+        self.assertEqual(tweets[0]["author"]["name"], "Yunjiu")
+        self.assertEqual(tweets[0]["author"]["followers_count"], 100000)
+        self.assertEqual(tweets[0]["media"][0]["type"], "photo")
+
+    def test_modern_profile_without_legacy_is_verifiable(self) -> None:
+        node = _tweet(
+            "254",
+            author_id="ignored",
+            screen_name="ignored",
+            media=[_photo("https://pbs.twimg.com/media/modern-profile.jpg")],
+        )
+        node.pop("core")
+        payload = _payload(
+            [node],
+            profile_id="1613079089879076864",
+            profile_screen_name="YunJiu",
+            profile_modern=True,
+        )
+
+        profile = parse_user_media_profile(payload)
+        assert profile is not None
+        self.assertEqual(profile["user_id"], "1613079089879076864")
+        self.assertEqual(profile["screen_name"], "YunJiu")
+        self.assertEqual(profile["name"], "Yunjiu")
+        self.assertEqual(profile["followers_count"], 100000)
+
+        tweets = parse_user_media_payload(payload, verified_author=profile)
+        self.assertEqual([tweet["tweet_id"] for tweet in tweets], ["254"])
+        self.assertEqual(tweets[0]["author"]["user_id"], "1613079089879076864")
+
+    def test_visibility_wrapped_profile_timeline_is_parsed(self) -> None:
+        node = _tweet(
+            "255",
+            author_id="ignored",
+            screen_name="ignored",
+            media=[_photo("https://pbs.twimg.com/media/wrapped.jpg")],
+        )
+        node.pop("core")
+        payload = _payload(
+            [node],
+            profile_id="1",
+            profile_modern=True,
+            visibility_wrapped=True,
+            exhausted=True,
+        )
+
+        profile = parse_user_media_profile(payload)
+        assert profile is not None
+        self.assertEqual(profile["user_id"], "1")
+        self.assertTrue(user_media_timeline_exhausted(payload))
+        tweets = parse_user_media_payload(payload, verified_author=profile)
+        self.assertEqual([tweet["tweet_id"] for tweet in tweets], ["255"])
+
+    def test_leaf_with_other_author_is_not_relabelled_as_profile(self) -> None:
+        # leaf 自带别人的 rest_id，但形状不完整（core 里没有 screen_name）：
+        # 既不能被 fallback 顶替，也不能走 verified profile 的兜底路径。
+        node = _tweet(
+            "256",
+            author_id="999",
+            screen_name="other",
+            media=[_photo("https://pbs.twimg.com/media/foreign.jpg")],
+            modern_user=True,
+        )
+        node["core"]["user_results"]["result"]["core"].pop("screen_name")
+        payload = _payload([node], profile_id="1")
+
+        profile = parse_user_media_profile(payload)
+        assert profile is not None
+        tweets = parse_user_media_payload(payload, verified_author=profile)
+
+        self.assertEqual(tweets, [])
+
+    def test_rejects_http_and_graphql_error_responses(self) -> None:
+        self.assertTrue(_is_clean_user_media_response(200, {"data": {}}))
+        self.assertFalse(_is_clean_user_media_response(403, {"data": {}}))
+        self.assertFalse(_is_clean_user_media_response(500, {"data": {}}))
+        self.assertFalse(
+            _is_clean_user_media_response(
+                200, {"data": {"user": {}}, "errors": [{"message": "rate limited"}]}
+            )
+        )
+        self.assertFalse(_is_clean_user_media_response(200, []))
+        self.assertFalse(_is_clean_user_media_response(200, None))
 
     def test_keeps_only_target_author_photos(self) -> None:
         tweets = _parse(
@@ -523,6 +666,70 @@ class FetchUserMediaSafetyTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(result["newest_id"])
         self.assertEqual(result["tweets"], [])
         self.assertTrue(result["complete"])
+
+    async def test_http_error_response_forces_incomplete(self) -> None:
+        clean = _payload(
+            [
+                _tweet(
+                    "300",
+                    author_id="1",
+                    screen_name="yunjiu",
+                    media=[_photo("https://pbs.twimg.com/media/ok.jpg")],
+                )
+            ],
+            profile_id="1",
+            exhausted=True,
+        )
+        broken = _UserMediaResponse({"data": {}}, status=429)
+
+        result, _ = await _fetch_with_payloads([[clean, broken]], since_id="100")
+
+        self.assertEqual([item["tweet_id"] for item in result["tweets"]], ["300"])
+        # 时间线明确到底了，但有响应被拒 → 可能漏页 → 不允许上游推进游标
+        self.assertFalse(result["complete"])
+
+    async def test_graphql_error_response_forces_incomplete(self) -> None:
+        clean = _payload([], profile_id="1", exhausted=True)
+        broken = _UserMediaResponse(
+            {"data": {"user": None}, "errors": [{"message": "Rate limit exceeded"}]}
+        )
+
+        result, _ = await _fetch_with_payloads([[clean, broken]], since_id="100")
+
+        self.assertEqual(result["tweets"], [])
+        self.assertFalse(result["complete"])
+
+    async def test_only_error_responses_fail_closed(self) -> None:
+        broken = _UserMediaResponse(
+            {"errors": [{"message": "Rate limit exceeded"}]}, status=200
+        )
+        unauthorized = _UserMediaResponse({"data": {}}, status=401)
+
+        with self.assertRaisesRegex(RuntimeError, "未捕获"):
+            await _fetch_with_payloads([[broken, unauthorized]], since_id="100")
+
+    async def test_in_flight_response_is_settled_before_completeness(self) -> None:
+        payload = _payload(
+            [
+                _tweet(
+                    "300",
+                    author_id="1",
+                    screen_name="yunjiu",
+                    media=[_photo("https://pbs.twimg.com/media/slow.jpg")],
+                )
+            ],
+            profile_id="1",
+            exhausted=True,
+        )
+
+        result, page = await _fetch_with_payloads(
+            [[_SlowUserMediaResponse(payload, turns=3)]], since_id="100"
+        )
+
+        self.assertEqual([item["tweet_id"] for item in result["tweets"]], ["300"])
+        self.assertTrue(result["complete"])
+        # 响应在首轮就被结算，不必再滚动等待
+        self.assertEqual(page.scrolls, 0)
 
 
 class BrowserQueueSlotTests(unittest.TestCase):

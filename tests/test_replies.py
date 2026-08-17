@@ -265,6 +265,85 @@ class GraphqlReplyParsingTests(unittest.TestCase):
         self.assertEqual(tweets[0]["author"]["user_id"], "10")
         self.assertFalse(tweets[0]["author"]["is_verified"])
 
+    def test_modern_user_object_without_legacy_is_parsed(self) -> None:
+        tweet = _tweet(
+            "222",
+            author_id="10",
+            screen_name="target",
+            created_at=self.now,
+        )
+        user = tweet["core"]["user_results"]["result"]
+        user.pop("legacy")
+        user["core"] = {"screen_name": "Target", "name": "Target Name"}
+        user["relationship_counts"] = {"followers": 4321}
+
+        tweets = parse_graphql_tweets({"entries": [_entry(tweet)]})
+
+        self.assertEqual([item["tweet_id"] for item in tweets], ["222"])
+        author = tweets[0]["author"]
+        self.assertEqual(author["user_id"], "10")
+        self.assertEqual(author["screen_name"], "Target")
+        self.assertEqual(author["name"], "Target Name")
+        self.assertEqual(author["followers_count"], 4321)
+        self.assertEqual(tweets[0]["url"], "https://x.com/Target/status/222")
+
+    def test_modern_user_keeps_payload_identity_over_fallback(self) -> None:
+        tweet = _tweet(
+            "223",
+            author_id="10",
+            screen_name="target",
+            created_at=self.now,
+        )
+        user = tweet["core"]["user_results"]["result"]
+        user.pop("legacy")
+        user["core"] = {"screen_name": "Target", "name": "Target Name"}
+
+        tweets = parse_graphql_tweets(
+            {"entries": [_entry(tweet)]},
+            fallback_author={"user_id": "99", "screen_name": "someone-else"},
+        )
+
+        self.assertEqual(tweets[0]["author"]["user_id"], "10")
+        self.assertEqual(tweets[0]["author"]["screen_name"], "Target")
+
+    def test_conflicting_fallback_identity_is_rejected(self) -> None:
+        tweet = _tweet(
+            "224",
+            author_id="10",
+            screen_name="target",
+            created_at=self.now,
+        )
+        user = tweet["core"]["user_results"]["result"]
+        user.pop("legacy")
+        # 只有 rest_id、没有任何用户名：fallback 与 payload 的 id 冲突时必须放弃
+        tweets = parse_graphql_tweets(
+            {"entries": [_entry(tweet)]},
+            fallback_author={"user_id": "99", "screen_name": "someone-else"},
+        )
+        self.assertEqual(tweets, [])
+
+        # id 一致时才允许用 fallback 补出用户名
+        tweets = parse_graphql_tweets(
+            {"entries": [_entry(tweet)]},
+            fallback_author={"user_id": "10", "screen_name": "target"},
+        )
+        self.assertEqual([item["tweet_id"] for item in tweets], ["224"])
+        self.assertEqual(tweets[0]["author"]["screen_name"], "target")
+
+    def test_unresolvable_identity_returns_nothing(self) -> None:
+        tweet = _tweet(
+            "225",
+            author_id="10",
+            screen_name="target",
+            created_at=self.now,
+        )
+        tweet["core"]["user_results"]["result"] = {"legacy": {"name": "no id"}}
+
+        self.assertEqual(parse_graphql_tweets({"entries": [_entry(tweet)]}), [])
+        self.assertEqual(
+            parse_graphql_tweets({"entries": [_entry(tweet)]}, fallback_author=None), []
+        )
+
     def test_legacy_and_affiliate_verification_is_public(self) -> None:
         legacy = parse_graphql_tweets(
             {

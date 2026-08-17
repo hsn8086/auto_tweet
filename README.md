@@ -82,3 +82,15 @@ docker exec auto_tweet-auto-twi-1 sh -c 'cd /app && uv run python -m unittest di
   `complete` 才为 `true`。达到滚动/响应上限、仅连续空转、或新图片超过 32 条时
   均返回 `complete=false`，上游不得推进游标。当前协议没有分页 token；超过上限
   的积压会持续 fail-closed，需人工处理后再恢复增量扫描。
+- **时间线采集的坑**（改 `sender.py` 前必读）：
+  - profile timeline 的 GraphQL operation 名会在
+    `UserTweets`/`UserWithProfileTweetsQueryV2`/
+    `UserWithProfileTweetsAndRepliesQueryV2`/`UserOriginalsTimeline` 之间切换，
+    后三个不是 `UserTweets` 的子串——按子串匹配会在 X 改版后一条响应都收不到，
+    表现为"账号没发新图"。
+  - 非 200 或带 `errors` 的响应一律不计入采集：这类响应意味着本轮可能漏页，
+    必须 `complete=false`；全部响应都被拒时直接报错，不返回空结果。
+  - 判定完成度前必须先结算在途响应任务，否则刚回来的那一页会被漏掉。
+  - X 的现代 user 对象没有 `legacy`：用户名/昵称在 `core`，粉丝数在
+    `relationship_counts.followers`；缺 `legacy` 不代表缺身份，不能据此改用
+    配置里的账号。

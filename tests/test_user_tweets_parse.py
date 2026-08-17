@@ -47,9 +47,7 @@ def _user_tweets_payload(instructions):
     return {
         "data": {
             "user": {
-                "result": {
-                    "timeline": {"timeline": {"instructions": instructions}}
-                }
+                "result": {"timeline": {"timeline": {"instructions": instructions}}}
             }
         }
     }
@@ -179,9 +177,33 @@ class IsUserTweetsResponseTests(unittest.TestCase):
         )
         self.assertTrue(is_user_tweets_response(resp))
 
+    def test_matches_every_known_profile_timeline_operation(self):
+        # 后三个 operation 不是 "UserTweets" 的子串；只匹配子串会在 X 改版后
+        # 一条时间线响应都收不到。
+        for operation in (
+            "UserTweets",
+            "UserWithProfileTweetsQueryV2",
+            "UserWithProfileTweetsAndRepliesQueryV2",
+            "UserOriginalsTimeline",
+        ):
+            with self.subTest(operation=operation):
+                resp = self._FakeResponse(
+                    f"https://x.com/i/api/graphql/abc/{operation}?variables=%7B%7D"
+                )
+                self.assertTrue(is_user_tweets_response(resp))
+
     def test_rejects_other_operations(self):
         resp = self._FakeResponse("https://x.com/i/api/graphql/abc/TweetDetail")
         self.assertFalse(is_user_tweets_response(resp))
+
+    def test_rejects_unrelated_profile_operations(self):
+        for url in (
+            "https://x.com/i/api/graphql/abc/UserByScreenName?x=1",
+            "https://x.com/i/api/graphql/abc/UserMedia?x=1",
+            "https://x.com/i/api/2/notifications/all.json",
+        ):
+            with self.subTest(url=url):
+                self.assertFalse(is_user_tweets_response(self._FakeResponse(url)))
 
     def test_rejects_post(self):
         resp = self._FakeResponse(

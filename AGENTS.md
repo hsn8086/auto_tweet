@@ -59,6 +59,11 @@ curl -fsS http://127.0.0.1:8000/api/v1/tweet/queue
 5. API 协议变更（参数/响应字段）必须同步上游仓库 MusekeToolsBot 的
    `backend/src/x_reconcile.py`、`backend/src/router/img.py`、
    `auto_send/src/main.py` 及其 AGENTS.md。
+6. **时间线采集 fail-closed**：`user_media` 的 `complete` 是上游推进游标的唯一
+   依据。响应被拒（非 200 / GraphQL `errors`）、结果被 `max_tweets` 截断、只靠
+   空转退出，一律 `complete=false`；判完成度前先结算在途响应任务。作者身份只能
+   来自实际抓到的 profile `rest_id`；leaf 自带别的作者 id 时不得用 profile 身份
+   顶替（详见 README「时间线采集的坑」）。
 
 ## 安全红线
 
@@ -77,7 +82,9 @@ curl -fsS http://127.0.0.1:8000/api/v1/tweet/queue
   (:open_post_composer)、媒体上传+spoiler、AI 声明、CreateTweet 响应捕获、
   queue_stats；回复 composer；fetch_verified_replies；fetch_user_tweets_metrics（开 profile 页滚动收 UserTweets
   响应——X 首屏 SSR 首个 XHR 在滚动后才出现、分页必须 scrollTo 文档底部，
-  这两个坑别"优化"回去）
+  这两个坑别"优化"回去）；timeline operation 白名单在
+  `USER_TIMELINE_OPERATIONS` / `is_replies_timeline_response`，profile 版
+  operation 不是 `UserTweets` 的子串，别退回子串匹配
 - `src/result_store.py` — request_id → 结果 的文件存储（原子写、TTL 清理）
 - `src/replies.py` — state twid 校验、GraphQL tweet/user/media 归一化、认证直接
   回复与父推文 48h 过滤

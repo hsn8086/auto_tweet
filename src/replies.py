@@ -324,33 +324,52 @@ def normalize_tweet(
     user = _unwrap_user(user_results)
     user_legacy = user.get("legacy") if isinstance(user, dict) else None
     user_core = user.get("core") if isinstance(user, dict) else None
-    if isinstance(user_legacy, dict):
-        user_id = _string_id(user.get("rest_id")) if isinstance(user, dict) else None
+    # X 的现代 user 对象没有 legacy：用户名/昵称在 core，粉丝数在
+    # relationship_counts。缺 legacy 不代表缺身份，不能直接跳到 fallback。
+    if isinstance(user, dict):
+        user_fields = user_legacy if isinstance(user_legacy, dict) else {}
+        user_id = _string_id(user.get("rest_id"))
         screen_name = (
             str(
-                user_legacy.get("screen_name")
+                user_fields.get("screen_name")
                 or (user_core.get("screen_name") if isinstance(user_core, dict) else "")
                 or ""
             )
             .strip()
             .lstrip("@")
         )
-    elif fallback_author is not None:
-        user = {}
-        user_legacy = {
-            "name": fallback_author.get("name"),
-            "followers_count": fallback_author.get("followers_count"),
-        }
-        user_id = _string_id(fallback_author.get("user_id"))
-        screen_name = str(fallback_author.get("screen_name") or "").strip().lstrip("@")
     else:
-        return None
+        user_fields = {}
+        user_id = None
+        screen_name = ""
+    if (user_id is None or not screen_name) and fallback_author is not None:
+        fallback_id = _string_id(fallback_author.get("user_id"))
+        fallback_name = (
+            str(fallback_author.get("screen_name") or "").strip().lstrip("@")
+        )
+        # fallback 只能补缺，不能覆盖 payload 自己给出的身份。
+        if user_id is not None and fallback_id is not None and user_id != fallback_id:
+            return None
+        if (
+            screen_name
+            and fallback_name
+            and screen_name.casefold() != fallback_name.casefold()
+        ):
+            return None
+        user_id = user_id or fallback_id
+        screen_name = screen_name or fallback_name
+        user_fields = {
+            **user_fields,
+            "name": user_fields.get("name") or fallback_author.get("name"),
+            "followers_count": user_fields.get("followers_count")
+            or fallback_author.get("followers_count"),
+        }
     if user_id is None or not screen_name:
         return None
 
     verification = user.get("verification") if isinstance(user, dict) else None
     verified_type = (
-        user.get("verified_type") or user_legacy.get("verified_type")
+        user.get("verified_type") or user_fields.get("verified_type")
         if isinstance(user, dict)
         else None
     )
@@ -365,12 +384,16 @@ def normalize_tweet(
     is_verified = bool(
         is_blue_verified
         or (isinstance(user, dict) and user.get("verified"))
-        or user_legacy.get("verified")
+        or user_fields.get("verified")
         or (isinstance(verification, dict) and verification.get("verified"))
         or verified_type
         or (isinstance(affiliate, dict) and affiliate)
     )
-    followers_count = user_legacy.get("followers_count")
+    followers_count = user_fields.get("followers_count")
+    if not isinstance(followers_count, int) or isinstance(followers_count, bool):
+        relationship_counts = user.get("relationship_counts") if user else None
+        if isinstance(relationship_counts, dict):
+            followers_count = relationship_counts.get("followers")
     if not isinstance(followers_count, int) or isinstance(followers_count, bool):
         followers_count = None
     created = parse_datetime(str(legacy.get("created_at") or ""))
@@ -403,7 +426,7 @@ def normalize_tweet(
             "user_id": user_id,
             "screen_name": screen_name,
             "name": str(
-                user_legacy.get("name")
+                user_fields.get("name")
                 or (user_core.get("name") if isinstance(user_core, dict) else "")
                 or ""
             ),

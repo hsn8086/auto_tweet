@@ -1,9 +1,9 @@
 import asyncio
-import unittest
 import tempfile
+import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, cast
+from typing import Any, Self, cast
 from unittest.mock import AsyncMock, patch
 
 from src import sender
@@ -47,6 +47,30 @@ class SenderHelperTests(unittest.IsolatedAsyncioTestCase):
         )()
 
         self.assertTrue(sender.is_replies_timeline_response(cast(Any, response)))
+
+    def test_reply_timeline_response_supports_user_originals_operation(self) -> None:
+        response = type(
+            "Response",
+            (),
+            {
+                "url": "https://x.com/i/api/graphql/hash/UserOriginalsTimeline",
+                "request": type("Request", (), {"method": "GET"})(),
+            },
+        )()
+
+        self.assertTrue(sender.is_replies_timeline_response(cast(Any, response)))
+
+    def test_reply_timeline_response_rejects_unrelated_operation(self) -> None:
+        response = type(
+            "Response",
+            (),
+            {
+                "url": "https://x.com/i/api/graphql/hash/UserByScreenName",
+                "request": type("Request", (), {"method": "GET"})(),
+            },
+        )()
+
+        self.assertFalse(sender.is_replies_timeline_response(cast(Any, response)))
 
     async def test_timeline_retry_stops_after_first_matched_response(self) -> None:
         empty = sender.TimelineCollection([], False, False, 0)
@@ -147,6 +171,137 @@ class SenderHelperTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.matched_responses, 1)
         self.assertEqual([item["tweet_id"] for item in result.tweets], ["200"])
 
+    async def test_timeline_settles_in_flight_response_before_completeness(
+        self,
+    ) -> None:
+        """An in-flight page must reset idle state before completeness is decided."""
+
+        class Page:
+            def __init__(self) -> None:
+                self.response_handler = None
+                self.closed = False
+                self.scrolls = 0
+
+            def on(self, event: str, handler) -> None:
+                if event == "response":
+                    self.response_handler = handler
+
+            async def goto(self, *_args, **_kwargs) -> None:
+                assert self.response_handler is not None
+
+            async def wait_for_timeout(self, _timeout: int) -> None:
+                pass
+
+            async def evaluate(self, _script: str) -> None:
+                # 第 3 次滚动才收到新页。若下一轮不 settle，扫描会把它误记为
+                # 第 4 次空转并提前宣告 complete。
+                self.scrolls += 1
+                if self.scrolls == 3:
+                    assert self.response_handler is not None
+                    self.response_handler(SlowResponse())
+
+            async def close(self) -> None:
+                self.closed = True
+
+        class SlowResponse:
+            url = "https://x.com/i/api/graphql/id/NotificationsTimeline"
+            request = type("Request", (), {"method": "GET"})()
+            status = 200
+
+            async def json(self) -> dict[str, bool]:
+                # 放大 response 事件与 body 读取完成之间的竞态窗口。
+                for _ in range(5):
+                    await asyncio.sleep(0)
+                return {"ready": True}
+
+        class Context:
+            def __init__(self, page: Page) -> None:
+                self.page = page
+
+            async def new_page(self) -> Page:
+                return self.page
+
+        page = Page()
+        parsed = [
+            {
+                "tweet_id": "900",
+                "created_at": "2026-08-17T00:00:00+00:00",
+                "in_reply_to_user_id": "10",
+                "author": {"user_id": "20"},
+            }
+        ]
+        with patch("src.sender.parse_graphql_tweets", return_value=parsed):
+            result = await sender._collect_replies_timeline(
+                cast(Any, Context(page)),
+                "https://x.com/notifications/verified",
+                max_scrolls=3,
+            )
+
+        self.assertFalse(result.complete)
+        self.assertEqual([item["tweet_id"] for item in result.tweets], ["900"])
+
+    async def test_timeline_rejected_responses_force_incomplete(self) -> None:
+        class Response:
+            url = "https://x.com/i/api/graphql/id/NotificationsTimeline"
+            request = type("Request", (), {"method": "GET"})()
+
+            def __init__(self, status: int, payload: dict[str, Any]) -> None:
+                self.status = status
+                self.payload = payload
+
+            async def json(self) -> dict[str, Any]:
+                return self.payload
+
+        class Page:
+            def __init__(self) -> None:
+                self.response_handler = None
+
+            def on(self, event: str, handler) -> None:
+                if event == "response":
+                    self.response_handler = handler
+
+            async def goto(self, *_args, **_kwargs) -> None:
+                assert self.response_handler is not None
+                await self.response_handler(Response(200, {"data": {}}))
+                await self.response_handler(Response(200, {"errors": [{"code": 1}]}))
+                await self.response_handler(Response(429, {"data": {}}))
+
+            async def wait_for_timeout(self, _timeout: int) -> None:
+                pass
+
+            async def evaluate(self, _script: str) -> None:
+                pass
+
+            async def close(self) -> None:
+                pass
+
+        class Context:
+            def __init__(self, page: Page) -> None:
+                self.page = page
+
+            async def new_page(self) -> Page:
+                return self.page
+
+        parsed = [
+            {
+                "tweet_id": "901",
+                "created_at": "2026-08-17T00:00:00+00:00",
+                "in_reply_to_user_id": "10",
+                "author": {"user_id": "20"},
+            }
+        ]
+        with patch("src.sender.parse_graphql_tweets", return_value=parsed):
+            result = await sender._collect_replies_timeline(
+                cast(Any, Context(Page())),
+                "https://x.com/notifications/verified",
+                max_scrolls=0,
+            )
+
+        self.assertEqual(result.matched_responses, 1)
+        self.assertEqual(result.response_errors, 2)
+        self.assertFalse(result.complete)
+        self.assertEqual([item["tweet_id"] for item in result.tweets], ["901"])
+
     async def test_wait_e_returns_messageful_timeout(self) -> None:
         blocked = FakeLocator(enabled=False)
 
@@ -205,7 +360,7 @@ class SenderHelperTests(unittest.IsolatedAsyncioTestCase):
                 pass
 
         class ResponseWaiter:
-            async def __aenter__(self) -> "ResponseWaiter":
+            async def __aenter__(self) -> Self:
                 return self
 
             async def __aexit__(self, *_args) -> None:
@@ -291,6 +446,134 @@ class SenderHelperTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(entry["status"], STATUS_SENT_UNCONFIRMED)
             self.assertEqual(chromium.launch.await_count, 1)
 
+    async def _assert_teardown_cancellation_is_sent_unconfirmed(
+        self, teardown_phase: str
+    ) -> None:
+        class Composer(FakeLocator):
+            async def wait_for(self, **_kwargs) -> None:
+                pass
+
+            async def focus(self) -> None:
+                pass
+
+            async def fill(self, _text: str) -> None:
+                pass
+
+        class ResponseWaiter:
+            async def __aenter__(self) -> Self:
+                return self
+
+            async def __aexit__(self, *_args) -> None:
+                pass
+
+            @property
+            async def value(self):
+                return type("Response", (), {"status": 200})()
+
+        class Page:
+            def __init__(self) -> None:
+                self.request_handlers = []
+
+            def on(self, event: str, handler) -> None:
+                if event == "request":
+                    self.request_handlers.append(handler)
+
+            def expect_response(self, *_args, **_kwargs) -> ResponseWaiter:
+                return ResponseWaiter()
+
+        class Button(FakeLocator):
+            def __init__(self, page: Page) -> None:
+                super().__init__()
+                self.page = page
+
+            async def click(self) -> None:
+                await super().click()
+                request = type(
+                    "Request",
+                    (),
+                    {
+                        "url": "https://x.com/i/api/graphql/id/CreateTweet",
+                        "method": "POST",
+                    },
+                )()
+                for handler in self.page.request_handlers:
+                    handler(request)
+
+        page = Page()
+        composer = Composer()
+        button = Button(page)
+        context = type("Context", (), {"new_page": AsyncMock(return_value=page)})()
+
+        async def close_browser() -> None:
+            if teardown_phase == "browser_close":
+                await asyncio.sleep(60)
+
+        browser = type(
+            "Browser",
+            (),
+            {
+                "new_context": AsyncMock(return_value=context),
+                "close": AsyncMock(side_effect=close_browser),
+            },
+        )()
+        chromium = type("Chromium", (), {"launch": AsyncMock(return_value=browser)})()
+
+        class PlaywrightContext:
+            async def __aenter__(self):
+                return type("Playwright", (), {"chromium": chromium})()
+
+            async def __aexit__(self, *_args) -> None:
+                if teardown_phase == "playwright_exit":
+                    await asyncio.sleep(60)
+                if teardown_phase == "playwright_error":
+                    raise sender.PlaywrightError("teardown failed")
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = ResultStore(Path(directory))
+            request_id = f"teardown-{teardown_phase}"
+            self.assertEqual(store.claim(request_id, 60).outcome, "claimed")
+            with (
+                patch("src.sender.async_playwright", return_value=PlaywrightContext()),
+                patch(
+                    "src.sender.open_post_composer", AsyncMock(return_value=composer)
+                ),
+                patch("src.sender.post_button_candidates", return_value=[button]),
+                patch("src.sender.take_debug_screenshot", AsyncMock()),
+                patch(
+                    "src.sender.extract_tweet_id_from_response",
+                    AsyncMock(return_value="123"),
+                ),
+                patch("src.router.tweet.SEND_TIMEOUT_SECONDS", 0.01),
+            ):
+                result = await _execute_send(
+                    sender.send("reply", State(cookies=[])),
+                    request_id=request_id,
+                    store=store,
+                    operation_name="test_teardown_send",
+                )
+
+            self.assertEqual(result["status"], "ok")
+            self.assertEqual(result["tweet_id"], "123")
+            self.assertIn("warning", result)
+            entry = store.get(request_id)
+            assert entry is not None
+            self.assertEqual(entry["status"], STATUS_SENT_UNCONFIRMED)
+            self.assertEqual(entry["tweet_id"], "123")
+            self.assertEqual(chromium.launch.await_count, 1)
+
+    async def test_browser_close_cancellation_after_success_is_sent_unconfirmed(
+        self,
+    ) -> None:
+        await self._assert_teardown_cancellation_is_sent_unconfirmed("browser_close")
+
+    async def test_playwright_exit_cancellation_after_success_is_sent_unconfirmed(
+        self,
+    ) -> None:
+        await self._assert_teardown_cancellation_is_sent_unconfirmed("playwright_exit")
+
+    async def test_playwright_error_after_success_is_sent_unconfirmed(self) -> None:
+        await self._assert_teardown_cancellation_is_sent_unconfirmed("playwright_error")
+
     async def test_open_reply_composer_targets_requested_tweet(self) -> None:
         reply_button = FakeLocator()
         composer = FakeLocator()
@@ -334,6 +617,7 @@ class SenderHelperTests(unittest.IsolatedAsyncioTestCase):
         class Response:
             url = "https://x.com/i/api/graphql/id/NotificationsTimeline"
             request = Request()
+            status = 200
 
             async def json(self) -> dict:
                 return {}
@@ -441,6 +725,7 @@ class SenderHelperTests(unittest.IsolatedAsyncioTestCase):
         class Response:
             url = "https://x.com/i/api/graphql/id/NotificationsTimeline"
             request = type("Request", (), {"method": "GET"})()
+            status = 200
 
             def __init__(self, page_no: int) -> None:
                 self.page_no = page_no
@@ -524,6 +809,7 @@ class SenderHelperTests(unittest.IsolatedAsyncioTestCase):
                     {
                         "url": "https://x.com/i/api/graphql/id/UserTweetsAndReplies",
                         "request": type("Request", (), {"method": "GET"})(),
+                        "status": 200,
                         "json": lambda _self: async_value({}),
                     },
                 )()
