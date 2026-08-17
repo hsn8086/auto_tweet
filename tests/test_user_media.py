@@ -152,7 +152,10 @@ class _UserMediaResponse:
         payload: dict[str, Any],
         *,
         status: int = 200,
-        url: str = "https://x.com/i/api/graphql/hash/UserTweets?variables=x",
+        url: str = (
+            "https://x.com/i/api/graphql/hash/UserTweets?"
+            "variables=%7B%22userId%22%3A%221%22%7D"
+        ),
     ) -> None:
         self.payload = payload
         self.status = status
@@ -219,12 +222,34 @@ class _UserMediaPage:
 
 
 async def _fetch_with_payloads(
-    payload_batches: list[list[dict[str, Any]]],
+    payload_batches: list[list[Any]],
     *,
+    include_profile_response: bool = True,
     close_responses: list[Any] | None = None,
     **kwargs: Any,
 ) -> tuple[dict[str, Any], _UserMediaPage]:
-    page = _UserMediaPage(payload_batches, close_responses)
+    batches = [list(batch) for batch in payload_batches]
+    has_profile_response = any(
+        isinstance(item, _UserMediaResponse)
+        and "/UserByScreenName" in item.url.split("?", 1)[0]
+        for batch in batches
+        for item in batch
+    )
+    if include_profile_response and not has_profile_response:
+        profile_payload = _payload([], profile_id="1", profile_modern=True)
+        profile_payload["data"]["user"]["result"].pop("timeline")
+        profile_response = _UserMediaResponse(
+            profile_payload,
+            url=(
+                "https://x.com/i/api/graphql/hash/UserByScreenName?"
+                "variables=%7B%22screen_name%22%3A%22yunjiu%22%7D"
+            ),
+        )
+        if batches:
+            batches[0].insert(0, profile_response)
+        else:
+            batches.append([profile_response])
+    page = _UserMediaPage(batches, close_responses)
     context = SimpleNamespace(new_page=AsyncMock(return_value=page))
     browser = SimpleNamespace(
         new_context=AsyncMock(return_value=context), close=AsyncMock()
@@ -603,19 +628,118 @@ class FilterUserMediaTests(unittest.TestCase):
 
 
 class FetchUserMediaSafetyTests(unittest.IsolatedAsyncioTestCase):
-    async def test_wrong_fetched_profile_id_fails_closed(self) -> None:
-        node = _tweet(
+    async def test_separate_profile_response_verifies_originals_timeline(
+        self,
+    ) -> None:
+        profile_payload = _payload([], profile_id="1", profile_modern=True)
+        profile_payload["data"]["user"]["result"].pop("timeline")
+        authorless = _tweet(
             "300",
             author_id="1",
             screen_name="yunjiu",
-            media=[_photo("https://pbs.twimg.com/media/wrong-profile.jpg")],
+            media=[_photo("https://pbs.twimg.com/media/separate-profile.jpg")],
         )
-        payload = _payload([node], profile_id="999")
+        authorless.pop("core")
+        timeline_payload = _payload([authorless], exhausted=True)
+        timeline = _UserMediaResponse(
+            timeline_payload,
+            url=(
+                "https://x.com/i/api/graphql/hash/UserOriginalsTimeline?"
+                "variables=%7B%22userId%22%3A%221%22%7D"
+            ),
+        )
+        # Timeline body resolves first to prove it is retained until identity arrives.
+        profile = _SlowUserMediaResponse(
+            profile_payload,
+            turns=3,
+            url=(
+                "https://x.com/i/api/graphql/hash/UserByScreenName?"
+                "variables=%7B%22screen_name%22%3A%22yunjiu%22%7D"
+            ),
+        )
+
+        result, page = await _fetch_with_payloads([[timeline, profile]], since_id="100")
+
+        self.assertEqual(result["target_user_id"], "1")
+        self.assertEqual([item["tweet_id"] for item in result["tweets"]], ["300"])
+        self.assertEqual(result["tweets"][0]["author"]["user_id"], "1")
+        self.assertTrue(result["complete"])
+        self.assertEqual(page.scrolls, 0)
+
+    async def test_foreign_timeline_variables_are_not_relabelled_as_profile(
+        self,
+    ) -> None:
+        profile_payload = _payload([], profile_id="1", profile_modern=True)
+        profile_payload["data"]["user"]["result"].pop("timeline")
+        profile = _UserMediaResponse(
+            profile_payload,
+            url=(
+                "https://x.com/i/api/graphql/hash/UserByScreenName?"
+                "variables=%7B%22screen_name%22%3A%22yunjiu%22%7D"
+            ),
+        )
+        authorless = _tweet(
+            "300",
+            author_id="999",
+            screen_name="other",
+            media=[_photo("https://pbs.twimg.com/media/foreign-timeline.jpg")],
+        )
+        authorless.pop("core")
+        foreign = _UserMediaResponse(
+            _payload([authorless], exhausted=True),
+            url=(
+                "https://x.com/i/api/graphql/hash/UserOriginalsTimeline?"
+                "variables=%7B%22userId%22%3A%22999%22%7D"
+            ),
+        )
+        foreign.json = AsyncMock(return_value=foreign.payload)
+
+        with self.assertRaisesRegex(RuntimeError, "未捕获"):
+            await _fetch_with_payloads([[profile, foreign]], since_id="100")
+
+        foreign.json.assert_not_awaited()
+
+    async def test_malformed_timeline_variables_fail_closed(self) -> None:
+        profile_payload = _payload([], profile_id="1", profile_modern=True)
+        profile_payload["data"]["user"]["result"].pop("timeline")
+        profile = _UserMediaResponse(
+            profile_payload,
+            url=(
+                "https://x.com/i/api/graphql/hash/UserByScreenName?"
+                "variables=%7B%22screen_name%22%3A%22yunjiu%22%7D"
+            ),
+        )
+        malformed = _UserMediaResponse(
+            _payload([], exhausted=True),
+            url=(
+                "https://x.com/i/api/graphql/hash/UserOriginalsTimeline?"
+                "variables=%7Bnot-json"
+            ),
+        )
+        malformed.json = AsyncMock(return_value=malformed.payload)
+
+        with self.assertRaisesRegex(RuntimeError, "未捕获"):
+            await _fetch_with_payloads([[profile, malformed]], since_id="100")
+
+        malformed.json.assert_not_awaited()
+
+    async def test_wrong_fetched_profile_id_fails_closed(self) -> None:
+        profile_payload = _payload([], profile_id="999", profile_modern=True)
+        profile_payload["data"]["user"]["result"].pop("timeline")
+        profile = _UserMediaResponse(
+            profile_payload,
+            url=(
+                "https://x.com/i/api/graphql/hash/UserByScreenName?"
+                "variables=%7B%22screen_name%22%3A%22yunjiu%22%7D"
+            ),
+        )
 
         with self.assertRaisesRegex(ValueError, "999.*期望 1"):
-            await _fetch_with_payloads([[payload]])
+            await _fetch_with_payloads([[profile]], include_profile_response=False)
 
-    async def test_authorless_leaf_is_not_pinned_without_verified_profile(self) -> None:
+    async def test_timeline_profile_fields_cannot_replace_profile_response(
+        self,
+    ) -> None:
         node = _tweet(
             "301",
             author_id="ignored",
@@ -625,7 +749,10 @@ class FetchUserMediaSafetyTests(unittest.IsolatedAsyncioTestCase):
         node.pop("core")
 
         with self.assertRaisesRegex(ValueError, "拒绝使用配置值"):
-            await _fetch_with_payloads([[_payload([node])]])
+            await _fetch_with_payloads(
+                [[_payload([node], profile_id="1", exhausted=True)]],
+                include_profile_response=False,
+            )
 
     async def test_more_than_32_new_photo_tweets_is_incomplete(self) -> None:
         nodes = [

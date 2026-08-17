@@ -1,9 +1,10 @@
 import asyncio
+import json
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 from loguru import logger
 from playwright.async_api import (
@@ -265,19 +266,85 @@ def _metrics_from_tweet_node(candidate: Any) -> dict[str, Any] | None:
 # 的子串，只匹配 "UserTweets" 会在改版后一条响应都收不到。
 USER_TIMELINE_OPERATIONS = (
     "UserTweets",
+    "UserTweetsAndReplies",
     "UserWithProfileTweetsQueryV2",
     "UserWithProfileTweetsAndRepliesQueryV2",
     "UserOriginalsTimeline",
 )
+USER_PROFILE_OPERATIONS = ("UserByScreenName",)
+
+
+def _graphql_operation_and_variables(
+    url: str,
+) -> tuple[str, dict[str, Any] | None]:
+    try:
+        parsed = urlsplit(url)
+        marker = "/i/api/graphql/"
+        if marker not in parsed.path:
+            return "", None
+        operation = parsed.path.rstrip("/").rsplit("/", 1)[-1]
+    except (TypeError, ValueError):
+        return "", None
+    raw_variables = parse_qs(parsed.query).get("variables")
+    if not raw_variables or len(raw_variables) != 1:
+        return operation, None
+    try:
+        variables = json.loads(raw_variables[0])
+        return operation, variables if isinstance(variables, dict) else None
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return operation, None
 
 
 def is_user_tweets_response(response: Any) -> bool:
-    if not any(operation in response.url for operation in USER_TIMELINE_OPERATIONS):
+    operation, _ = _graphql_operation_and_variables(response.url)
+    if operation not in USER_TIMELINE_OPERATIONS:
         return False
     try:
         return response.request.method == "GET"
     except Exception:
         return False
+
+
+def is_user_profile_response(response: Any) -> bool:
+    operation, _ = _graphql_operation_and_variables(response.url)
+    if operation not in USER_PROFILE_OPERATIONS:
+        return False
+    try:
+        return response.request.method == "GET"
+    except Exception:
+        return False
+
+
+def _user_media_variables_match_target(
+    operation: str,
+    variables: dict[str, Any] | None,
+    *,
+    screen_name: str,
+    target_user_id: str,
+) -> bool:
+    if variables is None:
+        return False
+    if operation in USER_PROFILE_OPERATIONS:
+        values = {
+            str(variables[key]).strip().lstrip("@").casefold()
+            for key in ("screen_name", "screenName")
+            if key in variables
+            and not isinstance(variables[key], bool)
+            and isinstance(variables[key], (str, int))
+            and str(variables[key]).strip()
+        }
+        return values == {screen_name.strip().lstrip("@").casefold()}
+    if operation in USER_TIMELINE_OPERATIONS:
+        values = {
+            str(variables[key]).strip()
+            for key in ("userId", "rest_id", "user_id")
+            if key in variables
+            and not isinstance(variables[key], bool)
+            and isinstance(variables[key], (str, int))
+            and str(variables[key]).strip()
+        }
+        return values == {target_user_id}
+    return False
 
 
 def parse_tweet_created_at(raw: str) -> "datetime | None":
@@ -926,20 +993,24 @@ async def fetch_user_media(
                 )
                 page = await context.new_page()
                 page.on("console", log_console_message)
-                payloads: asyncio.Queue[Any] = asyncio.Queue()
+                payloads: asyncio.Queue[tuple[bool, Any]] = asyncio.Queue()
                 matched_responses = 0
+                matched_profile_responses = 0
                 response_errors = 0
                 response_tasks: set[asyncio.Task[None]] = set()
                 accepting_responses = True
 
-                async def read_response(response: "Response") -> None:
-                    nonlocal matched_responses, response_errors
+                async def read_response(
+                    response: "Response", *, is_timeline: bool
+                ) -> None:
+                    nonlocal matched_responses, matched_profile_responses
+                    nonlocal response_errors
                     try:
                         payload = await response.json()
                         if not _is_clean_user_media_response(response.status, payload):
                             response_errors += 1
                             logger.warning(
-                                "Rejected UserTweets media response: status={} "
+                                "Rejected user media GraphQL response: status={} "
                                 "graphql_errors={}",
                                 response.status,
                                 bool(payload.get("errors"))
@@ -947,21 +1018,43 @@ async def fetch_user_media(
                                 else False,
                             )
                             return
-                        payloads.put_nowait(payload)
-                        matched_responses += 1
+                        payloads.put_nowait((is_timeline, payload))
+                        if is_timeline:
+                            matched_responses += 1
+                        else:
+                            matched_profile_responses += 1
                     except Exception as exc:
                         response_errors += 1
                         logger.warning(
-                            "Failed to read UserTweets media response: {}",
+                            "Failed to read user media GraphQL response: {}",
                             describe_send_exception(exc),
                         )
 
                 def on_response(response: "Response") -> None:
+                    nonlocal response_errors
                     if not accepting_responses:
                         return
-                    if not is_user_tweets_response(response):
+                    is_timeline = is_user_tweets_response(response)
+                    if not is_timeline and not is_user_profile_response(response):
                         return
-                    task = asyncio.create_task(read_response(response))
+                    operation, variables = _graphql_operation_and_variables(
+                        response.url
+                    )
+                    if not _user_media_variables_match_target(
+                        operation,
+                        variables,
+                        screen_name=name,
+                        target_user_id=expected_target_user_id,
+                    ):
+                        response_errors += 1
+                        logger.warning(
+                            "Rejected {} response with missing or conflicting target variables",
+                            operation,
+                        )
+                        return
+                    task = asyncio.create_task(
+                        read_response(response, is_timeline=is_timeline)
+                    )
                     response_tasks.add(task)
                     task.add_done_callback(response_tasks.discard)
 
@@ -985,10 +1078,12 @@ async def fetch_user_media(
                     got_new = False
                     while True:
                         try:
-                            payload = payloads.get_nowait()
+                            is_timeline, payload = payloads.get_nowait()
                         except asyncio.QueueEmpty:
                             break
-                        fetched_profile = parse_user_media_profile(payload)
+                        fetched_profile = (
+                            None if is_timeline else parse_user_media_profile(payload)
+                        )
                         if fetched_profile is not None:
                             fetched_user_id = str(fetched_profile.get("user_id") or "")
                             if fetched_user_id != expected_target_user_id:
@@ -1011,38 +1106,38 @@ async def fetch_user_media(
                                     }
                                 )
 
-                        if verified_profile is None:
+                        if is_timeline:
                             pending_payloads.append(payload)
-                            continue
-
-                        pages = [*pending_payloads, payload]
-                        pending_payloads.clear()
-                        for page_payload in pages:
-                            timeline_exhausted = (
-                                user_media_timeline_exhausted(page_payload)
-                                or timeline_exhausted
-                            )
-                            parsed = parse_user_media_payload(
-                                page_payload, verified_author=verified_profile
-                            )
-                            coverage_tweets = [
-                                item
-                                for item in parsed
-                                if not item.get("_pinned")
-                                and str(item.get("author", {}).get("user_id") or "")
-                                == expected_target_user_id
-                            ]
-                            if reached_since(
-                                coverage_tweets,
-                                since_id=since_id,
-                                since_time=since_time,
-                            ):
-                                reached_boundary = True
-                            for item in parsed:
-                                tweet_id = str(item.get("tweet_id") or "")
-                                if tweet_id and tweet_id not in collected:
-                                    collected[tweet_id] = item
-                                    got_new = True
+                    if verified_profile is None:
+                        return False
+                    pages = list(pending_payloads)
+                    pending_payloads.clear()
+                    for page_payload in pages:
+                        timeline_exhausted = (
+                            user_media_timeline_exhausted(page_payload)
+                            or timeline_exhausted
+                        )
+                        parsed = parse_user_media_payload(
+                            page_payload, verified_author=verified_profile
+                        )
+                        coverage_tweets = [
+                            item
+                            for item in parsed
+                            if not item.get("_pinned")
+                            and str(item.get("author", {}).get("user_id") or "")
+                            == expected_target_user_id
+                        ]
+                        if reached_since(
+                            coverage_tweets,
+                            since_id=since_id,
+                            since_time=since_time,
+                        ):
+                            reached_boundary = True
+                        for item in parsed:
+                            tweet_id = str(item.get("tweet_id") or "")
+                            if tweet_id and tweet_id not in collected:
+                                collected[tweet_id] = item
+                                got_new = True
                     return got_new
 
                 try:
@@ -1076,7 +1171,7 @@ async def fetch_user_media(
                     raise RuntimeError(
                         f"未捕获 @{name} 的个人时间线响应；请确认账号存在且登录 state 可访问该主页"
                     )
-                if verified_profile is None:
+                if matched_profile_responses == 0 or verified_profile is None:
                     raise ValueError(
                         f"无法从 @{name} 的 profile 响应确认 target_user_id；"
                         "拒绝使用配置值代替实际抓取身份"
@@ -1100,12 +1195,13 @@ async def fetch_user_media(
                 result["complete"] = complete
                 logger.info(
                     "User media collect for @{} user_id={}: {} photo tweets "
-                    "(responses={} errors={} boundary={} exhausted={} truncated={} "
-                    "complete={})",
+                    "(timeline_responses={} profile_responses={} errors={} "
+                    "boundary={} exhausted={} truncated={} complete={})",
                     name,
                     result["target_user_id"],
                     len(result["tweets"]),
                     matched_responses,
+                    matched_profile_responses,
                     response_errors,
                     reached_boundary,
                     timeline_exhausted,

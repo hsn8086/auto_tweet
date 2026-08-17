@@ -1,6 +1,7 @@
 import unittest
 
 from src.sender import (
+    is_user_profile_response,
     is_user_tweets_response,
     parse_tweet_created_at,
     parse_tweet_metrics_payload,
@@ -196,6 +197,13 @@ class IsUserTweetsResponseTests(unittest.TestCase):
         resp = self._FakeResponse("https://x.com/i/api/graphql/abc/TweetDetail")
         self.assertFalse(is_user_tweets_response(resp))
 
+    def test_operation_name_in_query_does_not_match(self):
+        resp = self._FakeResponse(
+            "https://x.com/i/api/graphql/abc/OtherOperation?"
+            "variables=%7B%22hint%22%3A%22UserOriginalsTimeline%22%7D"
+        )
+        self.assertFalse(is_user_tweets_response(resp))
+
     def test_rejects_unrelated_profile_operations(self):
         for url in (
             "https://x.com/i/api/graphql/abc/UserByScreenName?x=1",
@@ -210,6 +218,22 @@ class IsUserTweetsResponseTests(unittest.TestCase):
             "https://x.com/i/api/graphql/abc/UserTweets", method="POST"
         )
         self.assertFalse(is_user_tweets_response(resp))
+
+    def test_matches_user_by_screen_name_profile_response(self):
+        resp = self._FakeResponse(
+            "https://x.com/i/api/graphql/abc/UserByScreenName?variables=%7B%7D"
+        )
+        self.assertTrue(is_user_profile_response(resp))
+
+    def test_profile_response_rejects_post_and_other_operations(self):
+        post = self._FakeResponse(
+            "https://x.com/i/api/graphql/abc/UserByScreenName", method="POST"
+        )
+        other = self._FakeResponse(
+            "https://x.com/i/api/graphql/abc/UserOriginalsTimeline"
+        )
+        self.assertFalse(is_user_profile_response(post))
+        self.assertFalse(is_user_profile_response(other))
 
 
 class TweetMetricsPayloadRegressionTests(unittest.TestCase):
